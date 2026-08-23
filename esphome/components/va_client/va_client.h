@@ -64,6 +64,11 @@ class VaClient : public Component {
 
   // YAML-callable actions.
   void start_session();
+  // Opens a fresh session and replays the rolling mic pre-roll before live
+  // audio. Use only when no wake chime was played: the pre-roll is what makes
+  // a natural "wake word + command" utterance work, but a chime in that same
+  // buffer would be sent to the backend as speech.
+  void start_session_with_preroll();
   void send_interrupt();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
@@ -86,6 +91,7 @@ class VaClient : public Component {
  protected:
   void connect_();
   void schedule_reconnect_();
+  void start_session_(bool replay_preroll);
   void on_mic_data_(const std::vector<uint8_t> &samples);
   // Tell the backend to drop any uncommitted mic audio NOW. Sent when the mic
   // gate closes mid-stream by TIMER (a follow-up window expiring) — a partial
@@ -100,8 +106,9 @@ class VaClient : public Component {
   // garbage response. Sent on every start_session(); old backends ignore it.
   void send_wake_();
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
-  // ring while the session is closed; the ring is DISCARDED (not replayed) on
-  // session open — see preroll_discard_pending_.
+  // ring while the session is closed. A no-chime wake replays it so speech that
+  // overlaps wake-model detection latency is not clipped; chime/button paths
+  // discard it.
   void preroll_push_(const int16_t *data, size_t n);
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
@@ -166,13 +173,11 @@ class VaClient : public Component {
 
   // Mic pre-roll ring (int16 mono @ kMicSampleRate), allocated in PSRAM. The
   // rolling ring continuously retains the most recent kPreRollMs of mic audio
-  // while the session is closed. We DO NOT replay it on session open: during
-  // the wake-chime + tail-delay window the ring inevitably captures the chime
-  // leaking through the mic (XMOS AEC leaves ~10x), and replaying it fed the
-  // chime back to OpenAI as a phantom utterance ("Au!"). Instead, on session
-  // open we DISCARD the ring (preroll_discard_pending_), matching marcinnowak79
-  // gemini_proxy's ring_buffer_->reset() on start. Trade-off: a word spoken
-  // *during* the chime is lost; the user speaks once the listening ring lights.
+  // while the session is closed. No-chime wake-word sessions replay it so a
+  // command spoken immediately after the wake word survives the model's
+  // detection latency. Chime/button/follow-up sessions discard it: during a
+  // chime the ring captures speaker leakage (XMOS AEC leaves ~10x), and an
+  // arbitrary button press must not submit speech from before the press.
   // Touched ONLY by the mic task (on_mic_data_) — no lock needed.
   // preroll_discard_pending_ is set by start_session()/commit_followup_mic()
   // (main loop) and consumed by the mic task: a plain bool like streaming_.
@@ -183,6 +188,7 @@ class VaClient : public Component {
   size_t preroll_head_{0};   // next write index
   size_t preroll_count_{0};  // valid samples (<= capacity)
   bool preroll_discard_pending_{false};
+  bool preroll_replay_pending_{false};
 
   // Streaming gate. True while the mic should be forwarded to the server:
   //   - between wake-word start_session() and "listening"/"thinking"

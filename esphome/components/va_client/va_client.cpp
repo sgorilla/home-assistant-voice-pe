@@ -637,9 +637,8 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
 
   // Streaming gate. When no session is active we don't forward frames to the
   // server (otherwise OpenAI's VAD would respond to any room speech — the wake
-  // word would be decoration). We keep a rolling pre-roll ring while closed,
-  // but it is DISCARDED on session open (see below), so this is just a cheap
-  // rolling buffer kept around for a possible future capture-gating approach.
+  // word would be decoration). Keep a rolling pre-roll ring while closed so a
+  // no-chime wake can forward speech that overlapped wake-model latency.
   // The session opens via start_session() (wake handler) and closes on
   // "phase":"idle" from the server (response.done).
   if (!this->streaming_) {
@@ -649,15 +648,48 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
 
   auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
 
-  // First frame of a fresh session: DISCARD the pre-roll instead of replaying
-  // it. The ring caught the wake chime leaking through the mic (XMOS AEC leaves
-  // ~10x) during the chime + tail-delay window; replaying it fed the chime back
-  // to OpenAI as a phantom utterance ("Au!"). Resetting here (the ring's only
-  // owner is this mic task) avoids any cross-task race — the main loop just sets
-  // the flag. Matches marcinnowak79 gemini_proxy's ring_buffer_->reset() on
-  // start. Trade-off: a word spoken *during* the chime is lost (the user speaks
-  // after the listening ring lights up).
-  if (this->preroll_discard_pending_) {
+  // First frame of a no-chime wake-word session: replay the pre-roll oldest to
+  // newest, then append this live frame. The wake event has already been sent
+  // by start_session_(), so the backend treats these samples as part of the new
+  // turn. Chunk the replay into 100 ms WS frames instead of one 19.2 KB burst.
+  if (this->preroll_replay_pending_) {
+    this->preroll_replay_pending_ = false;
+    this->preroll_discard_pending_ = false;
+    const size_t replay_count = this->preroll_count_;
+    const size_t cap = this->preroll_capacity_samples_;
+    if (replay_count > 0 && this->preroll_buf_ != nullptr && cap > 0) {
+      const size_t oldest = (this->preroll_head_ + cap - replay_count) % cap;
+      constexpr size_t kReplayChunkSamples = kMicSampleRate / 10;  // 100 ms
+      auto send_samples = [&](const int16_t *data, size_t count) {
+        while (count > 0) {
+          const size_t chunk = std::min(count, kReplayChunkSamples);
+          const int sent = esp_websocket_client_send_bin(
+              handle, reinterpret_cast<const char *>(data),
+              static_cast<int>(chunk * sizeof(int16_t)), 10 / portTICK_PERIOD_MS);
+          if (sent < 0) {
+            ESP_LOGW(TAG, "failed to send mic pre-roll chunk");
+            return false;
+          }
+          data += chunk;
+          count -= chunk;
+        }
+        return true;
+      };
+
+      const size_t first = std::min(replay_count, cap - oldest);
+      const bool first_ok = send_samples(this->preroll_buf_ + oldest, first);
+      const size_t second = replay_count - first;
+      if (first_ok && second > 0)
+        send_samples(this->preroll_buf_, second);
+      ESP_LOGI(TAG, "replayed %u ms mic pre-roll (%u samples)",
+               (unsigned) (replay_count * 1000 / kMicSampleRate),
+               (unsigned) replay_count);
+    }
+    this->preroll_count_ = 0;
+    this->preroll_head_ = 0;
+  } else if (this->preroll_discard_pending_) {
+    // Chime/button/follow-up paths intentionally discard prior audio. Reset in
+    // the mic task (the ring's sole owner) to avoid a cross-task buffer race.
     this->preroll_discard_pending_ = false;
     this->preroll_count_ = 0;
     this->preroll_head_ = 0;
@@ -935,7 +967,11 @@ void VaClient::set_phase_(const std::string &phase) {
   });
 }
 
-void VaClient::start_session() {
+void VaClient::start_session() { this->start_session_(false); }
+
+void VaClient::start_session_with_preroll() { this->start_session_(true); }
+
+void VaClient::start_session_(bool replay_preroll) {
   // Open the streaming window. on_mic_data_ will start forwarding frames to
   // the server until "phase":"idle" comes back (response.done). Without this
   // gate, OpenAI Realtime's server VAD would respond to any speech in the
@@ -967,12 +1003,13 @@ void VaClient::start_session() {
     this->send_interrupt();
   }
 
-  // Discard (do NOT replay) the pre-roll captured before this session. The ring
-  // caught the wake chime leaking through the mic during the chime/tail-delay
-  // window; replaying it fed the chime back to OpenAI as a phantom "Au!". The
-  // mic task does the actual ring reset (its sole owner) when it sees this flag.
-  this->preroll_discard_pending_ = true;
-  ESP_LOGI(TAG, "start_session() — streaming on");
+  // A no-chime wake replays the rolling buffer to preserve a command spoken in
+  // the same breath as the wake word. Every other caller discards it so chime
+  // leakage or arbitrary pre-button room audio is never submitted as speech.
+  this->preroll_replay_pending_ = replay_preroll;
+  this->preroll_discard_pending_ = !replay_preroll;
+  ESP_LOGI(TAG, "start_session() — streaming on%s",
+           replay_preroll ? " (pre-roll armed)" : "");
   this->streaming_ = true;
   // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
   // the residual-reply interrupt above so the backend sees interrupt → wake in
@@ -1174,6 +1211,7 @@ void VaClient::commit_followup_mic() {
   // Discard the pre-roll: the request_follow_up chime just played and leaked
   // into the ring; don't replay it to OpenAI. (Same "Au!" guard as the wake
   // path; consumed by the mic task on the next frame.)
+  this->preroll_replay_pending_ = false;
   this->preroll_discard_pending_ = true;
   this->streaming_ = true;
   this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
