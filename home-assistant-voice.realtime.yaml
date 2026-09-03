@@ -2304,12 +2304,12 @@ micro_wake_word:
                                         # buffer, so use the discard path.
                                         - lambda: 'id(va)->start_session();'
                                       else:
-                                        # No wake chime: replay the rolling 600 ms
-                                        # mic pre-roll before live audio. This keeps
-                                        # "Alexa, command" speech that overlaps the
-                                        # wake model's detection latency instead of
-                                        # forcing an artificial pause.
-                                        - lambda: 'id(va)->start_session_with_preroll();'
+                                        # Diagnostic isolation: retain rolling
+                                        # pre-roll capture, but discard it when the
+                                        # no-chime session opens. If repeated wake
+                                        # detection stays healthy, synchronous replay
+                                        # in the mic callback caused the regression.
+                                        - lambda: 'id(va)->start_session();'
                                   # Show "waiting for command" (blue spin) immediately on wake,
                                   # before the server VAD detects actual speech. va_client's
                                   # on_phase will overwrite to phase 3 (listening_for_command)
