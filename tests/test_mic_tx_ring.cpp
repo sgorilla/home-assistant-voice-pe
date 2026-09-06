@@ -1,8 +1,12 @@
 #include "../esphome/components/va_client/mic_tx_ring.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <deque>
+#include <random>
+#include <vector>
 
 using esphome::va_client::MicTxRing;
 
@@ -100,6 +104,57 @@ static void test_zero_capacity_is_safe() {
   assert(ring.size() == 0);
 }
 
+static void test_randomized_operations_match_reference_queue() {
+  std::mt19937 random(0x50495050);  // deterministic: "PIPP"
+
+  for (size_t capacity = 1; capacity <= 64; capacity++) {
+    std::vector<uint8_t> storage(capacity);
+    MicTxRing ring;
+    ring.set_storage(storage.data(), storage.size());
+    std::deque<uint8_t> reference;
+
+    for (size_t step = 0; step < 20000; step++) {
+      const uint32_t operation = random() % 6;
+      if (operation <= 1) {
+        const size_t length = random() % 17;
+        std::vector<uint8_t> input(length);
+        for (auto &byte : input)
+          byte = static_cast<uint8_t>(random());
+
+        const bool should_fit = length <= capacity - reference.size();
+        assert(ring.push_all(input.data(), input.size()) == should_fit);
+        if (should_fit) {
+          for (uint8_t byte : input)
+            reference.push_back(byte);
+        }
+      } else if (operation == 2) {
+        const size_t requested = random() % 80;
+        std::array<uint8_t, 80> actual{};
+        const size_t copied = ring.peek(actual.data(), requested);
+        assert(copied == std::min(requested, reference.size()));
+        for (size_t i = 0; i < copied; i++)
+          assert(actual[i] == reference[i]);
+      } else if (operation == 3) {
+        const size_t requested = random() % 80;
+        const size_t consumed = std::min(requested, reference.size());
+        ring.consume(requested);
+        for (size_t i = 0; i < consumed; i++)
+          reference.pop_front();
+      } else if (operation == 4) {
+        ring.clear();
+        reference.clear();
+      }
+
+      assert(ring.size() == reference.size());
+      assert(ring.free() == capacity - reference.size());
+      std::array<uint8_t, 64> actual{};
+      assert(ring.peek(actual.data(), actual.size()) == reference.size());
+      for (size_t i = 0; i < reference.size(); i++)
+        assert(actual[i] == reference[i]);
+    }
+  }
+}
+
 int main() {
   test_wraparound_preserves_order();
   test_full_write_is_all_or_nothing();
@@ -107,5 +162,6 @@ int main() {
   test_preroll_then_live_exactly_once();
   test_clear_removes_stale_session_audio();
   test_zero_capacity_is_safe();
+  test_randomized_operations_match_reference_queue();
   return 0;
 }
