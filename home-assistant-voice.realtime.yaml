@@ -2262,16 +2262,16 @@ micro_wake_word:
                                       priority: true
                                       sound_file: "error_cloud_expired"
                                 else:
-                                  # Regular wake word: play wake chime, start a new session.
-                                  # Stop the TTS playback chain first. The previous turn may
-                                  # still have downstream ring residual (~600 ms) even after
-                                  # the server said phase=idle — start_session()'s internal
-                                  # send_interrupt() flushes the PSRAM queue, but the leaf's
-                                  # own ring buffers it can't reach. Without this stop the
-                                  # tail of the old reply leaks under the wake chime.
-                                  # No-op when there's nothing playing.
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
+                                  # Regular wake word: keep the TTS playback chain warm.
+                                  # Bounded server send-ahead can fill the playback-prebuffer
+                                  # target immediately. An unconditional speaker.stop here then
+                                  # leaves only the 60 ms cold-chain prime before the first real
+                                  # sample, exposing a click/pop that realtime-paced delivery had
+                                  # accidentally hidden behind the longer buffer-fill interval.
+                                  # True reply interruptions still hard-stop the speaker in the
+                                  # replying/stop-word branches above. At ordinary idle, va_client
+                                  # has already deferred the turn boundary until its playback
+                                  # queues drain, so no stop/start churn is needed here.
                                   - if:
                                       condition:
                                         switch.is_on: wake_sound
