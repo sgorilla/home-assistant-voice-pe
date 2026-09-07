@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mic_tx_ring.h"
+#include "wake_preroll.h"
 
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
@@ -73,6 +74,12 @@ class VaClient : public Component {
   // a natural "wake word + command" utterance work, but a chime in that same
   // buffer would be sent to the backend as speech.
   void start_session_with_preroll();
+  // Called as the first action for a normal wake-word detection, before yaml
+  // may synchronously stop playback or cancel an old response. It closes the
+  // old mic stream immediately and marks the detector boundary. The mic task
+  // later selects the detector's small causal look-back plus audio captured
+  // after this boundary, without replaying the full wake phrase.
+  void begin_wake_capture();
   bool send_interrupt();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
@@ -102,6 +109,7 @@ class VaClient : public Component {
   // before microWakeWord, so blocking here withholds the same frame from wake
   // inference. It only enqueues PCM; loop() drains one bounded WS chunk.
   void clear_mic_tx_();
+  void clear_wake_boundary_();
   void drain_mic_tx_();
   void log_mic_health_();
   // Tell the backend to drop any uncommitted mic audio NOW. Sent when the mic
@@ -200,12 +208,36 @@ class VaClient : public Component {
   // (main loop) and consumed by the mic task, so both handoff flags are atomic.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
   static constexpr uint32_t kPreRollMs = 600;
+  // Okay Nabu 20241226.3 has a 10 ms feature step and five-frame sliding
+  // decision window, while ESPHome feeds inference from a 120 ms ring. A
+  // 200 ms look-back covers detector smoothing and the callback boundary
+  // without retaining a recognisable copy of the complete ~700+ ms phrase.
+  static constexpr uint32_t kWakeDetectionLookbackMs = 200;
+  static constexpr uint32_t kWakeBoundaryMaximumAgeMs = 2000;
+  // A drained software speaker can still have audio in the downstream i2s/DAC
+  // path. Do not replay microphone history until the last Realtime TTS feed is
+  // old enough that this physical tail cannot be present.
+  static constexpr uint32_t kWakeReplayTtsQuietMs = 1000;
   int16_t *preroll_buf_{nullptr};
   size_t preroll_capacity_samples_{0};
   size_t preroll_head_{0};   // next write index
   size_t preroll_count_{0};  // valid samples (<= capacity)
   std::atomic<uint32_t> preroll_discard_pending_{0};
   std::atomic<uint32_t> preroll_replay_pending_{0};
+  // The rolling-history sequence is incremented only by the mic task. The
+  // main-loop wake action snapshots it atomically without touching the ring's
+  // mic-task-owned head/count indices. The marker is single-use and age-bound.
+  std::atomic<uint32_t> preroll_total_samples_{0};
+  std::atomic<uint32_t> wake_boundary_sequence_{0};
+  std::atomic<uint32_t> wake_boundary_marked_ms_{0};
+  std::atomic<uint32_t> wake_boundary_armed_{0};
+  // Mic-task decision data is logged later from the main loop so the I2S
+  // callback remains allocation- and I/O-free.
+  std::atomic<uint32_t> wake_replay_log_pending_{0};
+  std::atomic<uint32_t> wake_replay_marker_valid_{0};
+  std::atomic<uint32_t> wake_replay_marker_age_ms_{0};
+  std::atomic<uint32_t> wake_replay_post_boundary_samples_{0};
+  std::atomic<uint32_t> wake_replay_selected_samples_{0};
 
   // Outbound microphone PCM queue. The I2S task is the sole producer and the
   // main ESPHome loop is the sole consumer. A lock protects the ring indices
@@ -273,7 +305,8 @@ class VaClient : public Component {
   // have audio queued in PSRAM + downstream rings. If we fire the LED
   // trigger immediately the device looks idle while still speaking. Hold
   // the "idle" emission until the queue drains + kFollowupOpenDelayMs.
-  bool idle_emit_pending_{false};
+  // Written by the WebSocket task and read by the main-loop wake path.
+  std::atomic<uint32_t> idle_emit_pending_{0};
   // Set by send_interrupt() so the phase=idle that follows from the server
   // doesn't trigger a follow-up mic window. The user explicitly asked us to
   // stop — they don't want the device sitting there listening.
@@ -401,7 +434,9 @@ class VaClient : public Component {
   // finish playing the TTS we wrote into it. Entered when audio_fill_
   // hits 0 with followup_pending_ set; exited when
   // !speaker_->has_buffered_data() OR kSpeakerStopTimeoutMs elapses.
-  bool waiting_for_speaker_stop_{false};
+  // Main-loop-owned in normal operation, but sampled by wake actions that can
+  // overlap a WebSocket phase transition; keep the canary gate race-free.
+  std::atomic<uint32_t> waiting_for_speaker_stop_{0};
   // millis() snapshot from when waiting_for_speaker_stop_ went true.
   // Used to fire the fallback timeout if the chain never drains.
   uint32_t speaker_stop_wait_started_ms_{0};

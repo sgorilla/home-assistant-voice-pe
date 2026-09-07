@@ -1,4 +1,5 @@
 #include "../esphome/components/va_client/mic_tx_ring.h"
+#include "../esphome/components/va_client/wake_preroll.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <vector>
 
 using esphome::va_client::MicTxRing;
+using esphome::va_client::wake_preroll_replay_samples;
 
 static void expect_bytes(MicTxRing &ring, const uint8_t *expected, size_t length) {
   std::array<uint8_t, 32> actual{};
@@ -104,6 +106,50 @@ static void test_zero_capacity_is_safe() {
   assert(ring.size() == 0);
 }
 
+static void test_wake_preroll_selection() {
+  constexpr size_t lookback = 3200;  // 200 ms at 16 kHz.
+  constexpr size_t capacity = 9600;  // 600 ms at 16 kHz.
+
+  // At the boundary, select only the detector look-back.
+  assert(wake_preroll_replay_samples(true, 1000, 1000, 50000, 50000,
+                                     capacity, capacity, lookback, 2000) ==
+         lookback);
+  // Preserve every sample captured during a 48 ms session-start handoff.
+  assert(wake_preroll_replay_samples(true, 1048, 1000, 50768, 50000,
+                                     capacity, capacity, lookback, 2000) ==
+         3968);
+  // Never exceed the 600 ms history ring.
+  assert(wake_preroll_replay_samples(true, 1800, 1000, 70000, 50000,
+                                     capacity, capacity, lookback, 2000) ==
+         capacity);
+  // A partially filled history can return only its available tail.
+  assert(wake_preroll_replay_samples(true, 1000, 1000, 50000, 50000,
+                                     1200, capacity, lookback, 2000) == 1200);
+  // Capacity, rather than arithmetic, is the final bound.
+  assert(wake_preroll_replay_samples(true, 1000, 1000, 50000, 50000,
+                                     capacity, 1000, lookback, 2000) == 1000);
+  assert(wake_preroll_replay_samples(true, 1000, 1000, 50000, 50000,
+                                     capacity, 0, lookback, 2000) == 0);
+
+  // Missing and stale markers fail closed. The exact age limit is valid.
+  assert(wake_preroll_replay_samples(false, 1000, 1000, 50000, 50000,
+                                     capacity, capacity, lookback, 2000) == 0);
+  assert(wake_preroll_replay_samples(true, 3000, 1000, 50000, 50000,
+                                     capacity, capacity, lookback, 2000) ==
+         lookback);
+  assert(wake_preroll_replay_samples(true, 3001, 1000, 50000, 50000,
+                                     capacity, capacity, lookback, 2000) == 0);
+
+  // uint32 millisecond and sample counters may wrap between mark and consume.
+  assert(wake_preroll_replay_samples(
+             true, 25, UINT32_MAX - 50, 400, UINT32_MAX - 500, capacity,
+             capacity, lookback, 2000) == 4101);
+  // The armed bit is authoritative, so a legitimate marker at millis()==0 is
+  // not mistaken for an absent marker.
+  assert(wake_preroll_replay_samples(true, 25, 0, 50025, 50000, capacity,
+                                     capacity, lookback, 2000) == 3225);
+}
+
 static void test_randomized_operations_match_reference_queue() {
   std::mt19937 random(0x50495050);  // deterministic: "PIPP"
 
@@ -162,6 +208,7 @@ int main() {
   test_preroll_then_live_exactly_once();
   test_clear_removes_stale_session_audio();
   test_zero_capacity_is_safe();
+  test_wake_preroll_selection();
   test_randomized_operations_match_reference_queue();
   return 0;
 }

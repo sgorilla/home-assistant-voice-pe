@@ -247,11 +247,11 @@ void VaClient::loop() {
   // speaker never reports STOPPED, we still progress so the LED doesn't
   // lock in `replying`.
   if (this->followup_pending_ && this->audio_fill_ == 0 &&
-      !this->waiting_for_speaker_stop_) {
-    this->waiting_for_speaker_stop_ = true;
+      !this->waiting_for_speaker_stop_.load(std::memory_order_acquire)) {
+    this->waiting_for_speaker_stop_.store(1, std::memory_order_release);
     this->speaker_stop_wait_started_ms_ = millis();
   }
-  if (this->waiting_for_speaker_stop_) {
+  if (this->waiting_for_speaker_stop_.load(std::memory_order_acquire)) {
     // Use has_buffered_data() instead of is_stopped(): the resampler only
     // transitions to STATE_STOPPED once its downstream (mixer source)
     // reports stopped, but our mixer sources are configured `timeout:
@@ -276,7 +276,7 @@ void VaClient::loop() {
                  "proceeding anyway (fallback)",
                  (unsigned) kSpeakerStopTimeoutMs);
       }
-      this->waiting_for_speaker_stop_ = false;
+      this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
       const bool was_request = this->request_follow_up_pending_;
       this->followup_pending_ = false;
       this->request_follow_up_pending_ = false;
@@ -406,10 +406,10 @@ void VaClient::fail_control_channel_(const char *operation) {
     this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_tts_tail");
     this->followup_pending_ = false;
-    this->waiting_for_speaker_stop_ = false;
+    this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
     this->request_follow_up_pending_ = false;
     this->followup_armed_ = false;
-    this->idle_emit_pending_ = false;
+    this->idle_emit_pending_.store(0, std::memory_order_release);
     this->current_phase_.store(static_cast<uint8_t>(Phase::IDLE));
     this->fire_phase_led_("idle");
   });
@@ -799,6 +799,9 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   bool queued = false;
   size_t replay_count = 0;
   size_t replay_bytes = 0;
+  bool replay_marker_valid = false;
+  uint32_t replay_marker_age_ms = 0;
+  uint32_t replay_post_boundary_samples = 0;
 
   portENTER_CRITICAL(&this->mic_tx_mux_);
   if (callback_generation != this->mic_tx_generation_.load(std::memory_order_relaxed) ||
@@ -810,10 +813,38 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
         this->preroll_replay_pending_.exchange(false, std::memory_order_acq_rel);
     if (replay_preroll) {
       this->preroll_discard_pending_.store(false, std::memory_order_release);
-      replay_count =
-          (this->preroll_buf_ != nullptr && this->preroll_capacity_samples_ > 0)
-              ? this->preroll_count_
-              : 0;
+      const bool marker_armed =
+          this->wake_boundary_armed_.exchange(0, std::memory_order_acq_rel) != 0;
+      uint32_t marked_ms = 0;
+      uint32_t boundary_sequence = 0;
+      uint32_t current_sequence = 0;
+      uint32_t marker_age_ms = 0;
+      uint32_t post_boundary_samples = 0;
+      const uint32_t now_ms = millis();
+      if (marker_armed) {
+        // begin_wake_capture() publishes armed last under mic_tx_mux_. Acquire
+        // it first, then read the corresponding marker while that same lock
+        // prevents a repeated wake from publishing a mixed generation.
+        marked_ms =
+            this->wake_boundary_marked_ms_.load(std::memory_order_acquire);
+        boundary_sequence =
+            this->wake_boundary_sequence_.load(std::memory_order_acquire);
+        current_sequence =
+            this->preroll_total_samples_.load(std::memory_order_acquire);
+        marker_age_ms = now_ms - marked_ms;
+        post_boundary_samples = current_sequence - boundary_sequence;
+      }
+      this->wake_boundary_marked_ms_.store(0, std::memory_order_relaxed);
+      replay_count = wake_preroll_replay_samples(
+          marker_armed, now_ms, marked_ms, current_sequence, boundary_sequence,
+          this->preroll_count_, this->preroll_capacity_samples_,
+          (size_t) kWakeDetectionLookbackMs * (kMicSampleRate / 1000),
+          kWakeBoundaryMaximumAgeMs);
+      replay_marker_valid =
+          marker_armed && marker_age_ms <= kWakeBoundaryMaximumAgeMs;
+      replay_marker_age_ms = marker_age_ms;
+      replay_post_boundary_samples =
+          replay_marker_valid ? post_boundary_samples : 0;
       replay_bytes = replay_count * sizeof(int16_t);
       const size_t cap = this->preroll_capacity_samples_;
       if (this->mic_tx_ring_.free() >= replay_bytes + live_bytes) {
@@ -858,14 +889,26 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   }
 
   if (replay_preroll) {
-    if (queued) {
-      this->replay_enqueued_samples_.store(static_cast<uint32_t>(replay_count),
-                                           std::memory_order_release);
-    } else {
+    if (!queued) {
       this->mic_tx_dropped_bytes_.fetch_add(
           static_cast<uint32_t>(replay_bytes + live_bytes),
           std::memory_order_relaxed);
     }
+    // Publish every canary field only after queue success/failure is known.
+    // wake_replay_log_pending_ is the final release store; drain_mic_tx_ first
+    // acquires it and only then consumes the corresponding statistics.
+    this->replay_enqueued_samples_.store(
+        queued ? static_cast<uint32_t>(replay_count) : 0,
+        std::memory_order_relaxed);
+    this->wake_replay_marker_valid_.store(replay_marker_valid ? 1 : 0,
+                                          std::memory_order_relaxed);
+    this->wake_replay_marker_age_ms_.store(replay_marker_age_ms,
+                                           std::memory_order_relaxed);
+    this->wake_replay_post_boundary_samples_.store(
+        replay_post_boundary_samples, std::memory_order_relaxed);
+    this->wake_replay_selected_samples_.store(
+        static_cast<uint32_t>(replay_count), std::memory_order_relaxed);
+    this->wake_replay_log_pending_.store(1, std::memory_order_release);
     this->preroll_count_ = 0;
     this->preroll_head_ = 0;
   } else {
@@ -891,13 +934,38 @@ void VaClient::clear_mic_tx_() {
   portEXIT_CRITICAL(&this->mic_tx_mux_);
 }
 
+void VaClient::clear_wake_boundary_() {
+  // All marker writers share mic_tx_mux_ with the mic-task consumer. This
+  // prevents a repeated wake or abort from mixing fields across generations.
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  this->wake_boundary_armed_.store(0, std::memory_order_release);
+  this->wake_boundary_marked_ms_.store(0, std::memory_order_relaxed);
+  this->wake_boundary_sequence_.store(0, std::memory_order_relaxed);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+}
+
 void VaClient::drain_mic_tx_() {
-  const uint32_t replay_samples =
-      this->replay_enqueued_samples_.exchange(0, std::memory_order_acq_rel);
-  if (replay_samples > 0) {
-    ESP_LOGI(TAG, "queued %u ms mic pre-roll (%u samples) without blocking I2S",
-             (unsigned) (replay_samples * 1000 / kMicSampleRate),
-             (unsigned) replay_samples);
+  if (this->wake_replay_log_pending_.exchange(0,
+                                              std::memory_order_acq_rel)) {
+    const uint32_t replay_samples =
+        this->replay_enqueued_samples_.exchange(0, std::memory_order_relaxed);
+    const uint32_t selected = this->wake_replay_selected_samples_.exchange(
+        0, std::memory_order_acq_rel);
+    const uint32_t post_boundary =
+        this->wake_replay_post_boundary_samples_.exchange(
+            0, std::memory_order_acq_rel);
+    const uint32_t marker_age = this->wake_replay_marker_age_ms_.exchange(
+        0, std::memory_order_acq_rel);
+    const bool marker_valid = this->wake_replay_marker_valid_.exchange(
+                                  0, std::memory_order_acq_rel) != 0;
+    ESP_LOGI(TAG,
+             "wake-boundary replay: valid=%s age=%ums lookback=%ums "
+             "post_boundary=%ums selected=%ums queued=%ums",
+             marker_valid ? "yes" : "no", (unsigned) marker_age,
+             (unsigned) kWakeDetectionLookbackMs,
+             (unsigned) (post_boundary * 1000 / kMicSampleRate),
+             (unsigned) (selected * 1000 / kMicSampleRate),
+             (unsigned) (replay_samples * 1000 / kMicSampleRate));
   }
 
   if (this->session_starting_.load(std::memory_order_acquire) ||
@@ -1013,6 +1081,8 @@ void VaClient::preroll_push_(const int16_t *data, size_t n) {
     if (this->preroll_count_ < cap)
       this->preroll_count_++;
   }
+  this->preroll_total_samples_.fetch_add(static_cast<uint32_t>(n),
+                                         std::memory_order_release);
 }
 
 VaClient::Phase VaClient::phase_from_string_(const std::string &phase) {
@@ -1116,7 +1186,7 @@ void VaClient::set_phase_(const std::string &phase) {
       this->audio_tail_ = 0;
       this->audio_fill_ = 0;
       portEXIT_CRITICAL(&this->ring_mux_);
-      this->idle_emit_pending_ = false;
+      this->idle_emit_pending_.store(0, std::memory_order_release);
       ESP_LOGI(TAG, "phase=listening during reply — barge-in, flushed TTS queue");
     }
     if (this->turn_t_listening_ == 0 && this->turn_t_wake_ != 0) {
@@ -1148,10 +1218,10 @@ void VaClient::set_phase_(const std::string &phase) {
     this->cancel_timeout("va_tts_tail");
     this->cancel_timeout("va_no_speech");
     this->followup_pending_ = false;
-    this->waiting_for_speaker_stop_ = false;
+    this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
     this->request_follow_up_pending_ = false;
     this->followup_armed_ = false;
-    this->idle_emit_pending_ = false;  // new turn began, drop any held idle
+    this->idle_emit_pending_.store(0, std::memory_order_release);  // new turn began, drop any held idle
   } else if (phase == "idle") {
     // Turn boundary: reset the WS-gap reference so the silence between THIS
     // reply and the NEXT turn's reply (~7 s across a follow-up exchange, where
@@ -1199,11 +1269,11 @@ void VaClient::set_phase_(const std::string &phase) {
       this->streaming_.store(false, std::memory_order_release);
       this->clear_mic_tx_();
       this->followup_pending_ = false;
-      this->waiting_for_speaker_stop_ = false;
+      this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
       this->request_follow_up_pending_ = false;
       this->followup_armed_ = false;
       this->cancel_timeout("va_tts_tail");
-      this->idle_emit_pending_ = false;
+      this->idle_emit_pending_.store(0, std::memory_order_release);
     } else if (this->audio_fill_ == 0) {
       // Stale-`idle` guard. prev==REPLYING with NO audio played since the last
       // wake (turn_t_first_audio_out_==0) means this `idle` belongs to a reply
@@ -1257,7 +1327,7 @@ void VaClient::set_phase_(const std::string &phase) {
       ESP_LOGI(TAG, "phase=idle but %u bytes still queued; LED + follow-up deferred",
                (unsigned) this->audio_fill_);
       this->followup_pending_ = true;
-      this->idle_emit_pending_ = true;
+      this->idle_emit_pending_.store(1, std::memory_order_release);
       return;  // suppress immediate trigger fire — open_followup_window_ will fire it later
     }
   }
@@ -1282,10 +1352,35 @@ void VaClient::start_session() { this->start_session_(false); }
 
 void VaClient::start_session_with_preroll() { this->start_session_(true); }
 
+void VaClient::begin_wake_capture() {
+  // Close the old stream before any yaml action can block. A racing callback
+  // that already passed the outer gate is rejected by the generation change
+  // and retained in pre-roll instead of the old TX queue. Publish the boundary
+  // under that same lock so a repeated wake cannot mix marker generations.
+  this->streaming_.store(false, std::memory_order_release);
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  this->mic_tx_ring_.clear();
+  this->mic_tx_generation_.fetch_add(1, std::memory_order_release);
+  this->wake_boundary_sequence_.store(
+      this->preroll_total_samples_.load(std::memory_order_acquire),
+      std::memory_order_relaxed);
+  this->wake_boundary_marked_ms_.store(millis(), std::memory_order_relaxed);
+  // Publish armed last so the mic task cannot observe a half-written marker.
+  this->wake_boundary_armed_.store(1, std::memory_order_release);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+}
+
 void VaClient::start_session_(bool replay_preroll) {
   if (this->session_starting_.exchange(1, std::memory_order_acq_rel) != 0) {
+    this->clear_wake_boundary_();
     ESP_LOGW(TAG, "start_session() ignored — wake marker send already in progress");
     return;
+  }
+
+  // Chime, button, and follow-up starts must never inherit a wake marker. Their
+  // rolling history may contain playback leakage or arbitrary room audio.
+  if (!replay_preroll) {
+    this->clear_wake_boundary_();
   }
 
   // Close the old producer before any bounded control send. In particular, a
@@ -1323,15 +1418,27 @@ void VaClient::start_session_(bool replay_preroll) {
   portENTER_CRITICAL(&this->ring_mux_);
   audio_fill_snapshot = this->audio_fill_;
   portEXIT_CRITICAL(&this->ring_mux_);
+  const uint32_t now_ms = millis();
+  const bool idle_pending_snapshot =
+      this->idle_emit_pending_.load(std::memory_order_acquire) != 0;
+  const bool speaker_wait_snapshot =
+      this->waiting_for_speaker_stop_.load(std::memory_order_acquire) != 0;
   const bool residual_reply =
-      audio_fill_snapshot > 0 ||
-      this->idle_emit_pending_ ||
-      phase_now == Phase::REPLYING ||
-      phase_now == Phase::THINKING;
+      audio_fill_snapshot > 0 || idle_pending_snapshot ||
+      phase_now == Phase::REPLYING || phase_now == Phase::THINKING;
+  const bool tts_tail_quiet =
+      this->last_fed_ms_ == 0 ||
+      static_cast<uint32_t>(now_ms - this->last_fed_ms_) >=
+          kWakeReplayTtsQuietMs;
+  const bool fresh_idle =
+      phase_now == Phase::IDLE && audio_fill_snapshot == 0 &&
+      !idle_pending_snapshot && !speaker_wait_snapshot &&
+      tts_tail_quiet;
   if (residual_reply) {
     ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
              phase_name_(phase_now), (unsigned) audio_fill_snapshot);
     if (!this->send_interrupt()) {
+      this->clear_wake_boundary_();
       this->session_starting_.store(false, std::memory_order_release);
       this->streaming_.store(false, std::memory_order_release);
       this->clear_mic_tx_();
@@ -1340,6 +1447,22 @@ void VaClient::start_session_(bool replay_preroll) {
       ESP_LOGW(TAG, "start_session() aborted — prior turn was not cancelled");
       return;
     }
+  }
+
+  // Even if yaml observed an idle phase, queued TTS or a racing server phase
+  // means the rolling mic history may contain the assistant's voice. Keep the
+  // initial canary strictly fresh-idle: interrupt the residual reply above,
+  // then discard history instead of replaying possible echo.
+  if (replay_preroll && !fresh_idle) {
+    ESP_LOGI(TAG,
+             "wake-boundary replay suppressed — not fresh idle "
+             "(phase=%s fill=%u idle_pending=%s speaker_wait=%s tts_quiet=%s)",
+             phase_name_(phase_now), (unsigned) audio_fill_snapshot,
+             idle_pending_snapshot ? "yes" : "no",
+             speaker_wait_snapshot ? "yes" : "no",
+             tts_tail_quiet ? "yes" : "no");
+    replay_preroll = false;
+    this->clear_wake_boundary_();
   }
 
   // A no-chime wake replays the rolling buffer to preserve a command spoken in
@@ -1351,10 +1474,10 @@ void VaClient::start_session_(bool replay_preroll) {
   // New wake word preempts every pending or active follow-up state from the
   // previous turn, even if the control marker below cannot be delivered.
   this->followup_pending_ = false;
-  this->waiting_for_speaker_stop_ = false;
+  this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
   this->request_follow_up_pending_ = false;
   this->followup_armed_ = false;
-  this->idle_emit_pending_ = false;
+  this->idle_emit_pending_.store(0, std::memory_order_release);
   this->suppress_followup_ = false;
   // A genuine new turn starts here — drop the post-stop `thinking` guard. Set
   // this after the residual-reply send_interrupt() above may have re-armed it.
@@ -1419,6 +1542,7 @@ void VaClient::start_session_(bool replay_preroll) {
     this->replay_enqueued_samples_.store(0, std::memory_order_relaxed);
     this->preroll_replay_pending_.store(false, std::memory_order_release);
     this->preroll_discard_pending_.store(true, std::memory_order_release);
+    this->clear_wake_boundary_();
     this->cancel_timeout("va_no_speech");
     this->turn_t_wake_ = 0;
     this->fire_phase_led_("idle");
@@ -1430,15 +1554,15 @@ void VaClient::start_session_(bool replay_preroll) {
 
   this->session_starting_.store(false, std::memory_order_release);
   ESP_LOGI(TAG, "start_session() — streaming on%s",
-           replay_preroll ? " (queued pre-roll armed)" : "");
+           replay_preroll ? " (bounded wake-boundary pre-roll armed)" : "");
 }
 
 void VaClient::open_followup_window_(uint32_t duration_ms) {
   // If a phase=idle LED transition was held back while audio drained, fire
   // it now so the LED goes to idle in sync with the speaker actually going
   // quiet (instead of as soon as the server emitted response.done).
-  if (this->idle_emit_pending_) {
-    this->idle_emit_pending_ = false;
+  if (this->idle_emit_pending_.load(std::memory_order_acquire)) {
+    this->idle_emit_pending_.store(0, std::memory_order_release);
     this->defer([this]() {
       for (auto *t : this->phase_triggers_) {
         t->trigger("idle");
@@ -1682,10 +1806,10 @@ bool VaClient::send_interrupt() {
   this->streaming_.store(false, std::memory_order_release);
   this->clear_mic_tx_();
   this->followup_pending_ = false;
-  this->waiting_for_speaker_stop_ = false;
+  this->waiting_for_speaker_stop_.store(0, std::memory_order_release);
   this->request_follow_up_pending_ = false;
   this->followup_armed_ = false;
-  this->idle_emit_pending_ = false;
+  this->idle_emit_pending_.store(0, std::memory_order_release);
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_tts_tail");

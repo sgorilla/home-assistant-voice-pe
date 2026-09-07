@@ -2194,6 +2194,12 @@ micro_wake_word:
                                 args: ['id(voice_assistant_phase)']
                                 level: INFO
                     else:
+                      # Establish the audio boundary before any synchronous
+                      # interrupt or speaker-stop work. The mic task keeps only
+                      # the detector's bounded look-back plus everything
+                      # captured after this point; no-chime paths replay that
+                      # bounded region when the new backend turn opens.
+                      - lambda: 'id(va)->begin_wake_capture();'
                       # Non-stop wake word: branch on the assistant's current
                       # phase. Wake fired while replying = barge-in (interrupt
                       # the reply); idle/listening/thinking → fresh session.
@@ -2235,12 +2241,10 @@ micro_wake_word:
                                   # Was a hardcoded 400 ms; too short, the chime
                                   # tail leaked in as a ghost turn (2026-06-12).
                                   - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
-                            # Open the mic locally. Used to rely on the
-                            # bridge echoing phase=listening after interrupt;
-                            # bridge no longer does that (it would also pop
-                            # the mic open after a Stop), so we drive it
-                            # explicitly here. start_session() is idempotent
-                            # against the send_interrupt() above.
+                            # Reply/barge-in always discards history: it can
+                            # contain the assistant's TTS even when the wake
+                            # chime is disabled. Bounded replay is canaried only
+                            # for a fresh idle, no-chime wake.
                             - lambda: 'id(va)->start_session();'
                             - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                             - script.execute: control_leds
@@ -2303,15 +2307,13 @@ micro_wake_word:
                                         # buffer, so use the discard path.
                                         - lambda: 'id(va)->start_session();'
                                       else:
-                                        # No wake chime: start immediately, but do not
-                                        # replay pre-detection audio. The full rolling
-                                        # buffer contains the wake word itself (observed
-                                        # as a ghost "Kein Abo!" turn). The nonblocking
-                                        # TX queue still retains every frame captured
-                                        # while the wake control marker is being sent;
-                                        # session_starting_ prevents those frames from
-                                        # draining before that marker.
-                                        - lambda: 'id(va)->start_session();'
+                                        # No wake chime: replay only the bounded
+                                        # wake-boundary region. It includes the
+                                        # detector's 200 ms causal overlap and audio
+                                        # captured during the yaml handoff, not the
+                                        # complete wake phrase that caused the prior
+                                        # ghost "Kein Abo!" turn.
+                                        - lambda: 'id(va)->start_session_with_preroll();'
                                   # Show "waiting for command" (blue spin) immediately on wake,
                                   # before the server VAD detects actual speech. va_client's
                                   # on_phase will overwrite to phase 3 (listening_for_command)
