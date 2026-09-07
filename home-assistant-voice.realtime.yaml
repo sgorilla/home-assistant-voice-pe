@@ -2303,12 +2303,15 @@ micro_wake_word:
                                         # buffer, so use the discard path.
                                         - lambda: 'id(va)->start_session();'
                                       else:
-                                        # No wake chime: replay the rolling 600 ms
-                                        # mic pre-roll before live audio. This keeps
-                                        # "Alexa, command" speech that overlaps the
-                                        # wake model's detection latency instead of
-                                        # forcing an artificial pause.
-                                        - lambda: 'id(va)->start_session_with_preroll();'
+                                        # No wake chime: start immediately, but do not
+                                        # replay pre-detection audio. The full rolling
+                                        # buffer contains the wake word itself (observed
+                                        # as a ghost "Kein Abo!" turn). The nonblocking
+                                        # TX queue still retains every frame captured
+                                        # while the wake control marker is being sent;
+                                        # session_starting_ prevents those frames from
+                                        # draining before that marker.
+                                        - lambda: 'id(va)->start_session();'
                                   # Show "waiting for command" (blue spin) immediately on wake,
                                   # before the server VAD detects actual speech. va_client's
                                   # on_phase will overwrite to phase 3 (listening_for_command)
