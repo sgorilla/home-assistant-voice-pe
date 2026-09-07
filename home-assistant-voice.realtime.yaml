@@ -62,6 +62,9 @@ substitutions:
   # Lets a per-device stub test a va_client feature branch alongside the same
   # package branch. Stable devices should leave this at main.
   va_client_ref: main
+  # Lets measurement wrappers pin the Voice PE hardware component without
+  # changing the normal development default.
+  voice_kit_ref: dev
   # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
 
 esphome:
@@ -1891,7 +1894,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/esphome/home-assistant-voice-pe
-      ref: dev
+      ref: ${voice_kit_ref}
     components:
       - voice_kit
     refresh: 0s

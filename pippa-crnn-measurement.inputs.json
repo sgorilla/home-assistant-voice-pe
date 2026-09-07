@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "purpose": "Pippa issue #19 physical feasibility build inputs; measurement only",
+  "production_promotion": false,
+  "firmware_parent": "8babb3414fab843b16af7a7d68418dbf637c6262",
+  "voice_kit_commit": "0579e7b9d8504264719c593474c85447253c9dc1",
+  "vad_model_source_commit": "9a72109cc935f77e34cf8ffe7b868155c37ec201",
+  "candidate": {
+    "path": "models/pippa/candidate-16x8.tflite",
+    "size_bytes": 165960,
+    "sha256": "5841499a1a0420d4910a2f6b24e9e29ff271f2abeff65c64fd64f7d61d9bd770"
+  },
+  "descriptor": {
+    "path": "models/pippa/pippa-16x8.json",
+    "sha256": "733ecd2e44c06fb6e4ecaf8364337558e2b6fea5d070dd1b70a7b687a5bcb2d2",
+    "cutoff_byte": 183,
+    "sliding_window_size": 5,
+    "feature_step_ms": 10
+  },
+  "micro_wake_word_overlay": {
+    "reviewed_source_commit": "2ae0523c21d7c2aa68bffc1e73f86e6c62b458da",
+    "reviewed_baseline_files": {
+      "__init__.py": "6c954548a74508baa6a9b708e976905d96a08518b941a1dec4d2380fce399a52",
+      "automation.h": "3efba2558dab2ed445beb0562892cdcd3655923eb22559931ccbd51a34ffa281",
+      "micro_wake_word.cpp": "418cee3b87dda0a97b4759461168ebfaff8b0d13e9d014554aee7f58047b28c6",
+      "micro_wake_word.h": "c02fb0e63391aeb4f201e1e49665d33e1e9831474e58bbbfc492e04b8ac8faeb",
+      "model_data.cpp": "1c9cd00efc2c93867caec7431baf4b7828d4e6797680d296ab1075bc03da273f",
+      "model_data.h": "6dfb8da8fc6928c02d3c93d7fd8e15c1af38da2facc6597b45917585ecfe4d65",
+      "preprocessor_settings.h": "683b3ecca1a10bd778f883a2465b4cd073e6674afddfc7ba66cd8c16acabf6eb",
+      "streaming_model.cpp": "c04156243b47539523ea2bde27ac529e1cf48b79d34cba07cc9926c19557cd58",
+      "streaming_model.h": "0c7b9f6bd0154c06b4ff6f4531a30057fc6d94bea71b1741a8a5c90a8c616208"
+    },
+    "measurement_instrumented_files": {
+      "__init__.py": "6c954548a74508baa6a9b708e976905d96a08518b941a1dec4d2380fce399a52",
+      "automation.h": "3efba2558dab2ed445beb0562892cdcd3655923eb22559931ccbd51a34ffa281",
+      "micro_wake_word.cpp": "8741d045b0d097a060141b5cb80cb67c114aed21ba49f462a0fb1ebf6f0e9a33",
+      "micro_wake_word.h": "36978cdd55c6536b15f255e10360e0b255aad7eeb0a476ab8b4f2e5e1722b21a",
+      "model_data.cpp": "1c9cd00efc2c93867caec7431baf4b7828d4e6797680d296ab1075bc03da273f",
+      "model_data.h": "6dfb8da8fc6928c02d3c93d7fd8e15c1af38da2facc6597b45917585ecfe4d65",
+      "preprocessor_settings.h": "683b3ecca1a10bd778f883a2465b4cd073e6674afddfc7ba66cd8c16acabf6eb",
+      "streaming_model.cpp": "4a7a89a2c71462d03e8ec0d43e9c1e0b74bddd6431c8a6250d674a019f0aac2c",
+      "streaming_model.h": "5cf87a2e247723a7a069e4a3acb86d71d7f79b8299dd23719b5949eaa275c963"
+    }
+  },
+  "tflm": {
+    "registry_component": "espressif/esp-tflite-micro=1.3.3~1",
+    "upstream_commit": "78e5532e682d3863a3c2985c3a74eed0a9ebaa61",
+    "fork_repository": "https://github.com/sgorilla/esp-tflite-micro.git",
+    "fork_commit": "5c2441292b07c9ee3a6286674d0036e38c32152e",
+    "stock_source_hashes": {
+      "tensorflow/lite/micro/kernels/fully_connected_common.cc": "388bf81053aac4ce6d031e4995631deebeda020b3e02a9a80351074ebcfa960d",
+      "tensorflow/lite/micro/kernels/esp_nn/fully_connected.cc": "c23b68b0dceb783a37fa9eda5c3a4c4b53ae8977abde0f8f32c67f7ae2acce98"
+    },
+    "target_portable_output_hashes": {
+      "tensorflow/lite/micro/kernels/fully_connected_common.cc": "a91b2f52731c28c0a3dd8bb6740f7a1780d6a70ab5b3ab0de36abb6b85edcc5a",
+      "tensorflow/lite/micro/kernels/esp_nn/fully_connected.cc": "3f2de506cf4a2bcc29c509744d20ef5671b74b595149bb587cd32f6028127b75"
+    },
+    "target_portable_patch_manifest_sha256": "b58d303de3ee92d8d6dc500ad6d3d879539f9bd8431b83e8b6cda13afbd2fb39",
+    "target_portable_generator_sha256": "8f7171c6ff5dab2cdb0c2ebfb8dbe2b58ee96feb99755c257f846ec754fb85ec"
+  },
+  "off_device_validation_build": {
+    "flashable": false,
+    "credentials": "placeholders",
+    "target": "esp32s3",
+    "esphome_version": "2026.8.2",
+    "esp_idf_version": "5.5.5",
+    "ota_size_bytes": 3370000,
+    "ota_sha256": "e557c98f313739d8c84447970825fb3b5d189b0a93c5fb92886cb1c68532b1e1",
+    "diram_used_bytes": 174979,
+    "diram_total_bytes": 341760,
+    "app_partition_free_percent": 59
+  }
+}

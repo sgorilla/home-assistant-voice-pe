@@ -1,0 +1,84 @@
+# Pippa issue #19 physical feasibility configuration.
+#
+# MEASUREMENT ONLY: this is not a production promotion. It layers the reviewed
+# external-state CRNN runtime and candidate over the exact live firmware parent
+# (8babb3414fab843b16af7a7d68418dbf637c6262). Build it from this checkout so
+# the local external component and model paths resolve to the reviewed bytes.
+#
+# The TFLM dependency is pinned to the target-portable feature commit in the
+# project fork. That commit is derived from the exact source behind
+# espressif/esp-tflite-micro 1.3.3~1.
+
+substitutions:
+  name: pippa-crnn-measurement
+  friendly_name: Pippa CRNN Measurement
+  wifi_ssid: !env_var PIPPA_WIFI_SSID
+  wifi_password: !env_var PIPPA_WIFI_PASSWORD
+  ota_password: !env_var PIPPA_OTA_PASSWORD
+  api_key: !env_var PIPPA_API_KEY
+
+  # Freeze the two firmware-side Git dependencies used by the live parent.
+  va_client_ref: 8babb3414fab843b16af7a7d68418dbf637c6262
+  voice_kit_ref: 0579e7b9d8504264719c593474c85447253c9dc1
+
+packages:
+  realtime: !include home-assistant-voice.realtime.yaml
+
+esphome:
+  project:
+    name: "sgorilla.pippa-crnn-measurement"
+    version: "0.0.1"
+  build_flags:
+    - -DPIPPA_CRNN_METRICS
+
+esp32:
+  framework:
+    # ESPHome schedules YAML-declared IDF components at FINAL priority, so this
+    # path wins over micro_wake_word's stock `1.3.3~1` registry request.
+    components:
+      - name: espressif/esp-tflite-micro
+        source: https://github.com/sgorilla/esp-tflite-micro.git
+        ref: 5c2441292b07c9ee3a6286674d0036e38c32152e
+
+external_components:
+  - source:
+      type: local
+      path: esphome/components
+    components:
+      - micro_wake_word
+
+micro_wake_word:
+  # Pin the VAD asset that accompanied the reviewed ESPHome 2026.8.2 runtime
+  # proof instead of resolving the mutable model-repository main branch.
+  vad:
+    model: https://github.com/esphome/micro-wake-word-models/raw/9a72109cc935f77e34cf8ffe7b868155c37ec201/models/v2/vad.json
+  models:
+    # Remove the live parent's ordering, then add the measurement candidate
+    # first. Compile-time models default-enable only the first list entry.
+    - id: !remove okay_nabu
+    - id: !remove stop
+    - model: models/pippa/pippa-16x8.json
+      id: pippa
+      internal: true
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
+      id: stop
+      internal: true
+      probability_cutoff: 0.4
+    # Retain Okay Nabu as a disabled comparison/fallback. Keep its familiar ID
+    # for a reversible comparison; the API-connect action below overrides any
+    # persisted enabled preference.
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+      internal: true
+
+api:
+  on_client_connected:
+    # Make the measurement state deterministic even if model preferences exist
+    # from an earlier image. `stop` remains phase-controlled by the base config.
+    - micro_wake_word.enable_model: pippa
+    - micro_wake_word.disable_model: okay_nabu
+
+# The live selector tunes Okay Nabu-specific thresholds. Hide it in this fixed
+# operating-point measurement so it cannot imply that it adjusts Pippa.
+select:
+  - id: !remove wake_word_sensitivity

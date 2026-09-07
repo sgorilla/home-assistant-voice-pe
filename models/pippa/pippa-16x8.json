@@ -1,0 +1,17 @@
+{
+  "type": "micro",
+  "wake_word": "Pippa 16x8 measurement candidate",
+  "author": "Pippa project",
+  "model": "candidate-16x8.tflite",
+  "trained_languages": [
+    "en"
+  ],
+  "version": 2,
+  "micro": {
+    "probability_cutoff": 0.7176470588235294,
+    "sliding_window_size": 5,
+    "feature_step_size": 10,
+    "tensor_arena_size": 200000,
+    "minimum_esphome_version": "2026.8.2"
+  }
+}
