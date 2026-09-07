@@ -81,6 +81,32 @@ void VaClient::setup() {
                   (unsigned) kPreRollMs, (unsigned) this->preroll_capacity_samples_);
   }
 
+  // Network I/O must not run in the high-priority I2S callback: va_client's
+  // callback is registered before microWakeWord's callback, so a blocked send
+  // also withholds that same frame from wake inference. The mic task writes to
+  // this PSRAM queue; loop() copies and sends one bounded chunk at a time.
+  this->mic_tx_storage_ = static_cast<uint8_t *>(
+      heap_caps_malloc(kMicTxBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  this->mic_tx_send_buf_ = static_cast<uint8_t *>(
+      heap_caps_malloc(kMicTxSendChunkBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (this->mic_tx_storage_ == nullptr || this->mic_tx_send_buf_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate microphone TX queue (%u + %u bytes)",
+             (unsigned) kMicTxBufferBytes, (unsigned) kMicTxSendChunkBytes);
+    if (this->mic_tx_storage_ != nullptr) {
+      heap_caps_free(this->mic_tx_storage_);
+      this->mic_tx_storage_ = nullptr;
+    }
+    if (this->mic_tx_send_buf_ != nullptr) {
+      heap_caps_free(this->mic_tx_send_buf_);
+      this->mic_tx_send_buf_ = nullptr;
+    }
+    this->mark_failed();
+    return;
+  }
+  this->mic_tx_ring_.set_storage(this->mic_tx_storage_, kMicTxBufferBytes);
+  ESP_LOGCONFIG(TAG, "Allocated %u-byte nonblocking microphone TX queue in PSRAM",
+                (unsigned) kMicTxBufferBytes);
+
   // Tell the resampler what format we'll feed it. The resampler converts to
   // its yaml-configured output format (48k 16-bit) before passing to the
   // mixer → i2s leaf. Start the speaker task once so play() calls just push
@@ -95,6 +121,12 @@ void VaClient::setup() {
 }
 
 void VaClient::loop() {
+  // Always service input transport before playback. Some playback paths return
+  // early while priming the speaker chain; microphone audio must not wait on
+  // that unrelated output state.
+  this->drain_mic_tx_();
+  this->log_mic_health_();
+
   // Drain the audio ring buffer into the speaker. speaker.play() accepts
   // only what fits in its own ring (returns the count actually queued).
   if (this->speaker_ != nullptr && this->audio_buf_ != nullptr) {
@@ -347,28 +379,79 @@ void VaClient::schedule_reconnect_() {
   });
 }
 
+void VaClient::fail_control_channel_(const char *operation) {
+  // A timed-out control frame leaves backend protocol state unknown. Fail
+  // closed immediately. Pinned esp_websocket_client 1.7.0 has no nonblocking
+  // abort API: both stop() and close() eventually wait with portMAX_DELAY, so
+  // invoking either as recovery could recreate the permanent main-loop hang
+  // this path is designed to prevent. A real disconnect enters the normal
+  // reconnect path; the dirty flag is cleared only after the next connection's
+  // mandatory start marker is fully sent. Until then the device stays alive
+  // and visibly offline instead of accepting audio on uncertain protocol state.
+  const bool already_dirty =
+      this->control_channel_dirty_.exchange(1, std::memory_order_acq_rel) != 0;
+  this->ws_connected_.store(false, std::memory_order_release);
+  this->session_starting_.store(false, std::memory_order_release);
+  this->streaming_.store(false, std::memory_order_release);
+  this->clear_mic_tx_();
+
+  if (already_dirty)
+    return;
+
+  ESP_LOGE(TAG, "%s left control state uncertain — channel held fail-closed",
+           operation);
+  this->defer([this]() {
+    this->cancel_timeout("va_no_speech");
+    this->cancel_timeout("va_followup");
+    this->cancel_timeout("va_followup_open");
+    this->cancel_timeout("va_tts_tail");
+    this->followup_pending_ = false;
+    this->waiting_for_speaker_stop_ = false;
+    this->request_follow_up_pending_ = false;
+    this->followup_armed_ = false;
+    this->idle_emit_pending_ = false;
+    this->current_phase_.store(static_cast<uint8_t>(Phase::IDLE));
+    this->fire_phase_led_("idle");
+  });
+}
+
 void VaClient::on_ws_event(int32_t event_id, void *event_data) {
   auto *data = static_cast<esp_websocket_event_data_t *>(event_data);
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED: {
       ESP_LOGI(TAG, "WS connected");
-      this->ws_connected_ = true;
+      // Do not publish a usable connection until its mandatory clean-start
+      // marker is fully written. A previous control failure may have left this
+      // flag dirty across the disconnect specifically so no interim DATA can
+      // resurrect the old protocol state.
+      this->ws_connected_.store(false, std::memory_order_release);
+      const char start_msg[] = "{\"type\":\"start\"}";
+      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+      const int start_sent = esp_websocket_client_send_text(
+          handle, start_msg, sizeof(start_msg) - 1,
+          pdMS_TO_TICKS(kWsControlSendTimeoutMs));
+      if (start_sent != static_cast<int>(sizeof(start_msg) - 1) ||
+          !esp_websocket_client_is_connected(handle)) {
+        ESP_LOGW(TAG, "start marker send failed (sent=%d expected=%u)",
+                 start_sent, (unsigned) (sizeof(start_msg) - 1));
+        this->fail_control_channel_("start marker failure");
+        break;
+      }
+
+      this->control_channel_dirty_.store(0, std::memory_order_release);
+      this->ws_connected_.store(true, std::memory_order_release);
       this->reconnect_delay_ms_ = 1000;  // reset backoff on a clean open
       // Don't reset the failure counter / fired flag yet — a flap-and-die
       // link would spam chimes. Only re-arm after the connection has held
       // for kStableConnectionMs without a disconnect.
       this->set_timeout("va_stable_connection", kStableConnectionMs, [this]() {
-        if (this->ws_connected_) {
+        if (this->ws_connected_.load(std::memory_order_acquire)) {
           this->consecutive_failures_ = 0;
           this->repeated_failure_fired_ = false;
           ESP_LOGD(TAG, "WS stable for %u ms — error chime re-armed",
                    (unsigned) kStableConnectionMs);
         }
       });
-
-      const char start_msg[] = "{\"type\":\"start\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
       this->set_phase_("idle");
       break;
     }
@@ -400,10 +483,14 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED:
     case WEBSOCKET_EVENT_ERROR: {
-      if (this->ws_connected_) {
+      if (this->ws_connected_.load(std::memory_order_acquire)) {
         ESP_LOGW(TAG, "WS disconnected (event %d)", (int) event_id);
       }
-      this->ws_connected_ = false;
+      this->ws_connected_.store(false, std::memory_order_release);
+      this->session_starting_.store(false, std::memory_order_release);
+      this->streaming_.store(false, std::memory_order_release);
+      this->clear_mic_tx_();
+      this->cancel_timeout("va_no_speech");
       // Connection broke before the stability window elapsed — keep the
       // failure counter and the fired flag. A flapping link won't earn
       // a fresh chime.
@@ -423,6 +510,10 @@ void VaClient::handle_text_(const char *data, size_t len) {
 
   if (msg.find("\"type\":\"error\"") != std::string::npos) {
     ESP_LOGW(TAG, "Server reported error: %s", msg.c_str());
+    this->session_starting_.store(false, std::memory_order_release);
+    this->streaming_.store(false, std::memory_order_release);
+    this->clear_mic_tx_();
+    this->cancel_timeout("va_no_speech");
     // Without an audible cue the user just sees the LED go idle and
     // assumes the assistant ignored them. Reuse the on_repeated_failure
     // trigger — it already plays error_cloud_expired and the failure
@@ -478,6 +569,18 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
+  if (this->control_channel_dirty_.load(std::memory_order_acquire))
+    return;
+
+  // No valid turn phase or follow-up request can result from the new session
+  // until its wake marker is fully on the socket and queued PCM is released.
+  // Messages in this short interval belong to the previous turn. Connection
+  // hello and explicit error messages were handled above and are never hidden.
+  if (this->session_starting_.load(std::memory_order_acquire)) {
+    ESP_LOGD(TAG, "ignoring stale WS text while wake marker is being sent");
+    return;
+  }
+
   if (msg.find("\"type\":\"request_follow_up\"") != std::string::npos) {
     // Server's model called the request_follow_up tool — it asked a
     // question and wants the user to answer without saying a wake word.
@@ -508,6 +611,13 @@ void VaClient::handle_text_(const char *data, size_t len) {
 
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
+    return;
+  if (this->control_channel_dirty_.load(std::memory_order_acquire))
+    return;
+  // While a fresh wake marker is being sent, any binary audio necessarily
+  // belongs to the superseded turn: new microphone PCM is still transport-
+  // gated, so the backend cannot yet have generated a legitimate new reply.
+  if (this->session_starting_.load(std::memory_order_acquire))
     return;
   // After a "stop"/barge-in (send_interrupt) the backend is still streaming the
   // rest of the already-generated reply. Drop it so the cancelled reply goes
@@ -616,13 +726,29 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
 }
 
 void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
-  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
-    return;
+  // Snapshot the queue generation before touching this frame. A session
+  // boundary that occurs while we downmix must invalidate the eventual write.
+  const uint32_t callback_generation =
+      this->mic_tx_generation_.load(std::memory_order_acquire);
+  const uint32_t callback_started_us = micros();
+  this->mic_callback_count_.fetch_add(1, std::memory_order_relaxed);
+  this->last_mic_callback_ms_.store(millis(), std::memory_order_relaxed);
+  auto finish_callback = [this, callback_started_us]() {
+    const uint32_t elapsed_us = micros() - callback_started_us;
+    uint32_t previous_max = this->mic_callback_max_us_.load(std::memory_order_relaxed);
+    while (elapsed_us > previous_max &&
+           !this->mic_callback_max_us_.compare_exchange_weak(
+               previous_max, elapsed_us, std::memory_order_relaxed)) {
+    }
+  };
+
   // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
   // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
   // int16 mono. Real audio sits in the high 16 bits (ADC pads up to int32).
-  if (samples.size() < 8)
+  if (samples.size() < 8) {
+    finish_callback();
     return;
+  }
 
   const auto *in32 = reinterpret_cast<const int32_t *>(samples.data());
   size_t total_int32 = samples.size() / 4;
@@ -630,45 +756,250 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   size_t offset = this->mic_channel_ & 0x1;
 
   this->mono_buf_.resize(mono_samples);
+  uint32_t frame_peak = 0;
   for (size_t i = 0; i < mono_samples; i++) {
     int32_t s = in32[i * 2 + offset];
-    this->mono_buf_[i] = static_cast<int16_t>(s >> 16);
+    const int16_t mono = static_cast<int16_t>(s >> 16);
+    this->mono_buf_[i] = mono;
+    const uint32_t magnitude =
+        mono < 0 ? static_cast<uint32_t>(-static_cast<int32_t>(mono))
+                 : static_cast<uint32_t>(mono);
+    frame_peak = std::max(frame_peak, magnitude);
   }
+  uint32_t previous_peak = this->mic_signal_peak_.load(std::memory_order_relaxed);
+  while (frame_peak > previous_peak &&
+         !this->mic_signal_peak_.compare_exchange_weak(
+             previous_peak, frame_peak, std::memory_order_relaxed)) {
+  }
+  if (frame_peak == 0)
+    this->mic_zero_frame_count_.fetch_add(1, std::memory_order_relaxed);
 
-  // Streaming gate. When no session is active we don't forward frames to the
-  // server (otherwise OpenAI's VAD would respond to any room speech — the wake
-  // word would be decoration). We keep a rolling pre-roll ring while closed,
-  // but it is DISCARDED on session open (see below), so this is just a cheap
-  // rolling buffer kept around for a possible future capture-gating approach.
+  // Streaming gate. When no session is active (or the socket is down), retain
+  // only the rolling history. This callback performs memory copies only; doing
+  // a WebSocket send here blocks microWakeWord from receiving the same frame.
   // The session opens via start_session() (wake handler) and closes on
   // "phase":"idle" from the server (response.done).
-  if (!this->streaming_) {
+  if (!this->streaming_.load(std::memory_order_acquire) ||
+      !this->ws_connected_.load(std::memory_order_acquire) ||
+      this->ws_handle_ == nullptr) {
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
+    finish_callback();
     return;
   }
 
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  // Validate the callback's generation while holding the same lock as
+  // clear_mic_tx_(). The outer gate alone is insufficient: a callback can pass
+  // it, get pre-empted by a new-session clear, then otherwise append stale PCM
+  // after that clear. If a boundary raced us, retain this historical frame in
+  // the pre-roll ring; the next callback applies the new replay/discard policy.
+  const size_t live_bytes = this->mono_buf_.size() * sizeof(int16_t);
+  bool boundary_raced = false;
+  bool replay_preroll = false;
+  bool discard_preroll = false;
+  bool queued = false;
+  size_t replay_count = 0;
+  size_t replay_bytes = 0;
 
-  // First frame of a fresh session: DISCARD the pre-roll instead of replaying
-  // it. The ring caught the wake chime leaking through the mic (XMOS AEC leaves
-  // ~10x) during the chime + tail-delay window; replaying it fed the chime back
-  // to OpenAI as a phantom utterance ("Au!"). Resetting here (the ring's only
-  // owner is this mic task) avoids any cross-task race — the main loop just sets
-  // the flag. Matches marcinnowak79 gemini_proxy's ring_buffer_->reset() on
-  // start. Trade-off: a word spoken *during* the chime is lost (the user speaks
-  // after the listening ring lights up).
-  if (this->preroll_discard_pending_) {
-    this->preroll_discard_pending_ = false;
-    this->preroll_count_ = 0;
-    this->preroll_head_ = 0;
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  if (callback_generation != this->mic_tx_generation_.load(std::memory_order_relaxed) ||
+      !this->streaming_.load(std::memory_order_relaxed) ||
+      !this->ws_connected_.load(std::memory_order_relaxed)) {
+    boundary_raced = true;
+  } else {
+    replay_preroll =
+        this->preroll_replay_pending_.exchange(false, std::memory_order_acq_rel);
+    if (replay_preroll) {
+      this->preroll_discard_pending_.store(false, std::memory_order_release);
+      replay_count =
+          (this->preroll_buf_ != nullptr && this->preroll_capacity_samples_ > 0)
+              ? this->preroll_count_
+              : 0;
+      replay_bytes = replay_count * sizeof(int16_t);
+      const size_t cap = this->preroll_capacity_samples_;
+      if (this->mic_tx_ring_.free() >= replay_bytes + live_bytes) {
+        size_t oldest = 0;
+        size_t first = 0;
+        size_t second = 0;
+        if (replay_count > 0) {
+          oldest = (this->preroll_head_ + cap - replay_count) % cap;
+          first = std::min(replay_count, cap - oldest);
+          second = replay_count - first;
+        }
+        queued =
+            (first == 0 ||
+             this->mic_tx_ring_.push_all(
+                 reinterpret_cast<const uint8_t *>(this->preroll_buf_ + oldest),
+                 first * sizeof(int16_t))) &&
+            (second == 0 ||
+             this->mic_tx_ring_.push_all(
+                 reinterpret_cast<const uint8_t *>(this->preroll_buf_),
+                 second * sizeof(int16_t))) &&
+            this->mic_tx_ring_.push_all(
+                reinterpret_cast<const uint8_t *>(this->mono_buf_.data()), live_bytes);
+      }
+    } else {
+      discard_preroll =
+          this->preroll_discard_pending_.exchange(false, std::memory_order_acq_rel);
+      queued = this->mic_tx_ring_.push_all(
+          reinterpret_cast<const uint8_t *>(this->mono_buf_.data()), live_bytes);
+    }
+
+    if (queued) {
+      this->mic_tx_high_water_bytes_ =
+          std::max(this->mic_tx_high_water_bytes_, this->mic_tx_ring_.size());
+    }
+  }
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+
+  if (boundary_raced) {
+    this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
+    finish_callback();
+    return;
   }
 
-  // 10ms timeout (~portTICK_PERIOD_MS): if WS task is briefly busy we wait
-  // a tick rather than dropping the frame and spamming "Could not lock"
-  // errors. If we're swamped, we accept dropping rather than blocking mic.
-  esp_websocket_client_send_bin(handle, reinterpret_cast<const char *>(this->mono_buf_.data()),
-                                static_cast<int>(this->mono_buf_.size() * sizeof(int16_t)),
-                                10 / portTICK_PERIOD_MS);
+  if (replay_preroll) {
+    if (queued) {
+      this->replay_enqueued_samples_.store(static_cast<uint32_t>(replay_count),
+                                           std::memory_order_release);
+    } else {
+      this->mic_tx_dropped_bytes_.fetch_add(
+          static_cast<uint32_t>(replay_bytes + live_bytes),
+          std::memory_order_relaxed);
+    }
+    this->preroll_count_ = 0;
+    this->preroll_head_ = 0;
+  } else {
+    // Chime/button/follow-up paths intentionally discard prior audio. Reset in
+    // the mic task (the ring's sole owner) to avoid a cross-task buffer race.
+    if (discard_preroll) {
+      this->preroll_count_ = 0;
+      this->preroll_head_ = 0;
+    }
+    if (!queued) {
+      this->mic_tx_dropped_bytes_.fetch_add(static_cast<uint32_t>(live_bytes),
+                                            std::memory_order_relaxed);
+    }
+  }
+
+  finish_callback();
+}
+
+void VaClient::clear_mic_tx_() {
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  this->mic_tx_ring_.clear();
+  this->mic_tx_generation_.fetch_add(1, std::memory_order_release);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+}
+
+void VaClient::drain_mic_tx_() {
+  const uint32_t replay_samples =
+      this->replay_enqueued_samples_.exchange(0, std::memory_order_acq_rel);
+  if (replay_samples > 0) {
+    ESP_LOGI(TAG, "queued %u ms mic pre-roll (%u samples) without blocking I2S",
+             (unsigned) (replay_samples * 1000 / kMicSampleRate),
+             (unsigned) replay_samples);
+  }
+
+  if (this->session_starting_.load(std::memory_order_acquire) ||
+      !this->streaming_.load(std::memory_order_acquire) ||
+      !this->ws_connected_.load(std::memory_order_acquire) ||
+      this->ws_handle_ == nullptr || this->mic_tx_send_buf_ == nullptr) {
+    return;
+  }
+
+  size_t send_length = 0;
+  uint32_t generation = 0;
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  generation = this->mic_tx_generation_.load(std::memory_order_relaxed);
+  send_length = this->mic_tx_ring_.peek(this->mic_tx_send_buf_, kMicTxSendChunkBytes);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+  if (send_length == 0)
+    return;
+
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  const uint32_t send_started_us = micros();
+  const int sent = esp_websocket_client_send_bin(
+      handle, reinterpret_cast<const char *>(this->mic_tx_send_buf_),
+      static_cast<int>(send_length), 10 / portTICK_PERIOD_MS);
+  this->mic_tx_send_max_us_ =
+      std::max(this->mic_tx_send_max_us_, micros() - send_started_us);
+  if (sent <= 0) {
+    this->mic_tx_send_failures_++;
+    return;  // Retain the bytes for a later bounded retry.
+  }
+
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  // A session boundary can clear the ring from the WS task while send_bin()
+  // waits. Consume only if this is still the same queue generation.
+  if (generation == this->mic_tx_generation_.load(std::memory_order_relaxed)) {
+    this->mic_tx_ring_.consume(std::min(static_cast<size_t>(sent), send_length));
+  }
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+
+  if (static_cast<size_t>(sent) < send_length) {
+    this->mic_tx_send_failures_++;
+  }
+}
+
+void VaClient::log_mic_health_() {
+  const uint32_t now = millis();
+  if (now - this->last_mic_health_log_ms_ < kMicHealthLogMs)
+    return;
+  this->last_mic_health_log_ms_ = now;
+
+  const uint32_t callbacks = this->mic_callback_count_.load(std::memory_order_relaxed);
+  const uint32_t callback_delta = callbacks - this->last_mic_health_callback_count_;
+  this->last_mic_health_callback_count_ = callbacks;
+  const uint32_t last_callback = this->last_mic_callback_ms_.load(std::memory_order_relaxed);
+  const uint32_t callback_age = last_callback == 0 ? UINT32_MAX : now - last_callback;
+  const uint32_t callback_max_us =
+      this->mic_callback_max_us_.exchange(0, std::memory_order_acq_rel);
+  const uint32_t signal_peak =
+      this->mic_signal_peak_.exchange(0, std::memory_order_acq_rel);
+  const uint32_t zero_frames =
+      this->mic_zero_frame_count_.exchange(0, std::memory_order_acq_rel);
+  const uint32_t dropped =
+      this->mic_tx_dropped_bytes_.exchange(0, std::memory_order_acq_rel);
+  const uint32_t send_failures = this->mic_tx_send_failures_;
+  this->mic_tx_send_failures_ = 0;
+  const uint32_t send_max_us = this->mic_tx_send_max_us_;
+  this->mic_tx_send_max_us_ = 0;
+  const bool control_dirty =
+      this->control_channel_dirty_.load(std::memory_order_acquire) != 0;
+
+  size_t queued = 0;
+  size_t high_water = 0;
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  queued = this->mic_tx_ring_.size();
+  high_water = this->mic_tx_high_water_bytes_;
+  // Preserve the current fill as the starting point for the next interval.
+  this->mic_tx_high_water_bytes_ = queued;
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+
+  if (callback_delta == 0 || callback_age > 100 ||
+      (callback_delta > 0 && signal_peak == 0) || dropped > 0 ||
+      send_failures > 0 || control_dirty) {
+    ESP_LOGW(TAG,
+             "mic health: callbacks=%u/%ums age=%ums callback_max=%uus peak=%u "
+             "zero_frames=%u tx=%uB high=%uB dropped=%uB send_failures=%u "
+             "send_max=%uus control_dirty=%s",
+             (unsigned) callback_delta, (unsigned) kMicHealthLogMs,
+             (unsigned) callback_age, (unsigned) callback_max_us,
+             (unsigned) signal_peak, (unsigned) zero_frames,
+             (unsigned) queued, (unsigned) high_water, (unsigned) dropped,
+             (unsigned) send_failures, (unsigned) send_max_us,
+             control_dirty ? "yes" : "no");
+  } else {
+    ESP_LOGD(TAG,
+             "mic health: callbacks=%u/%ums age=%ums callback_max=%uus peak=%u "
+             "zero_frames=%u tx=%uB high=%uB dropped=0B send_failures=0 "
+             "send_max=%uus control_dirty=no",
+             (unsigned) callback_delta, (unsigned) kMicHealthLogMs,
+             (unsigned) callback_age, (unsigned) callback_max_us,
+             (unsigned) signal_peak, (unsigned) zero_frames,
+             (unsigned) queued, (unsigned) high_water,
+             (unsigned) send_max_us);
+  }
 }
 
 void VaClient::preroll_push_(const int16_t *data, size_t n) {
@@ -708,6 +1039,14 @@ const char *VaClient::phase_name_(Phase p) {
 }
 
 void VaClient::set_phase_(const std::string &phase) {
+  if (this->control_channel_dirty_.load(std::memory_order_acquire))
+    return;
+  if (this->session_starting_.load(std::memory_order_acquire)) {
+    ESP_LOGD(TAG, "ignoring stale phase=%s while wake marker is being sent",
+             phase.c_str());
+    return;
+  }
+
   // Don't dedupe — we want yaml-side control_leds to re-render even on
   // identical phase if other inputs (e.g. va WS connection state) have
   // changed since the last emission.
@@ -761,9 +1100,9 @@ void VaClient::set_phase_(const std::string &phase) {
   //                without re-triggering the wake word. Timer expiry closes
   //                the session.
   if (phase == "listening") {
-    if (!this->streaming_) {
+    if (!this->streaming_.load(std::memory_order_acquire)) {
       ESP_LOGI(TAG, "phase=listening — mic streaming on");
-      this->streaming_ = true;
+      this->streaming_.store(true, std::memory_order_release);
     }
     // Handsfree barge-in cut-over: a `listening` arriving while we still have
     // TTS queued means the backend's server VAD heard the user talk over the
@@ -795,9 +1134,11 @@ void VaClient::set_phase_(const std::string &phase) {
     // of audio → its input watchdog force-ends the turn with no transcript → the
     // turn hangs in thinking. No bot audio plays during thinking, so there's no
     // echo cost to keeping the mic open until the reply genuinely starts.
-    if (phase == "replying" && this->streaming_ && !this->barge_in_) {
+    if (phase == "replying" && this->streaming_.load(std::memory_order_acquire) &&
+        !this->barge_in_) {
       ESP_LOGI(TAG, "phase=replying — mic streaming off");
-      this->streaming_ = false;
+      this->streaming_.store(false, std::memory_order_release);
+      this->clear_mic_tx_();
     }
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_thinking_ = millis();
@@ -843,10 +1184,11 @@ void VaClient::set_phase_(const std::string &phase) {
       // Closing here can't cut a LIVE follow-up window short: the only idle that
       // reaches an open window is exactly such a disconnect — the backend sends
       // no idle while it's waiting for the user to answer.
-      if (this->streaming_) {
+      if (this->streaming_.load(std::memory_order_acquire)) {
         ESP_LOGI(TAG, "idle while mic open (prev=%s) — closing orphaned mic gate",
                  phase_name_(prev));
-        this->streaming_ = false;
+        this->streaming_.store(false, std::memory_order_release);
+        this->clear_mic_tx_();
         this->cancel_timeout("va_no_speech");
       }
     } else if (this->suppress_followup_) {
@@ -854,7 +1196,8 @@ void VaClient::set_phase_(const std::string &phase) {
       // Close the session cleanly: streaming off, no follow-up, fall through
       // to the regular trigger fire so the LED goes idle.
       this->suppress_followup_ = false;
-      this->streaming_ = false;
+      this->streaming_.store(false, std::memory_order_release);
+      this->clear_mic_tx_();
       this->followup_pending_ = false;
       this->waiting_for_speaker_stop_ = false;
       this->request_follow_up_pending_ = false;
@@ -892,7 +1235,7 @@ void VaClient::set_phase_(const std::string &phase) {
         // nothing else fires idle → fall through to the LED trigger below, else
         // the ring strands on `replying` (observed live 2026-06-14: rapid stops
         // left suppression on, the search reply was dropped, the LED hung).
-        if (this->streaming_) {
+        if (this->streaming_.load(std::memory_order_acquire)) {
           return;  // bare wake: va_no_speech owns the idle + mic
         }
         // else: fall through to fire the idle LED (still no follow-up).
@@ -935,7 +1278,26 @@ void VaClient::set_phase_(const std::string &phase) {
   });
 }
 
-void VaClient::start_session() {
+void VaClient::start_session() { this->start_session_(false); }
+
+void VaClient::start_session_with_preroll() { this->start_session_(true); }
+
+void VaClient::start_session_(bool replay_preroll) {
+  if (this->session_starting_.exchange(1, std::memory_order_acq_rel) != 0) {
+    ESP_LOGW(TAG, "start_session() ignored — wake marker send already in progress");
+    return;
+  }
+
+  // Close the old producer before any bounded control send. In particular, a
+  // residual-reply interrupt can wait up to kWsControlSendTimeoutMs; leaving
+  // streaming_ open during that wait would enqueue the user's same-breath
+  // command into the old TX queue, which send_interrupt() then clears. With
+  // the gate closed, those callbacks roll into pre-roll and survive for the
+  // fresh session instead.
+  this->streaming_.store(false, std::memory_order_release);
+  this->clear_mic_tx_();
+  this->replay_enqueued_samples_.store(0, std::memory_order_relaxed);
+
   // Open the streaming window. on_mic_data_ will start forwarding frames to
   // the server until "phase":"idle" comes back (response.done). Without this
   // gate, OpenAI Realtime's server VAD would respond to any speech in the
@@ -953,69 +1315,87 @@ void VaClient::start_session() {
   //      we'll never play, burning tokens.
   // The bridge treats interrupt as cheap when there's nothing to cancel
   // (response_cancel_not_active is in its benignCodes set), and
-  // input_audio_buffer.clear is safe here because mic frames for the new turn
-  // don't start flowing until after this function returns.
+  // input_audio_buffer.clear is safe here because the new turn's queue is
+  // already cleared above and its frames cannot drain until the wake marker is
+  // sent.
   const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+  size_t audio_fill_snapshot = 0;
+  portENTER_CRITICAL(&this->ring_mux_);
+  audio_fill_snapshot = this->audio_fill_;
+  portEXIT_CRITICAL(&this->ring_mux_);
   const bool residual_reply =
-      this->audio_fill_ > 0 ||
+      audio_fill_snapshot > 0 ||
       this->idle_emit_pending_ ||
       phase_now == Phase::REPLYING ||
       phase_now == Phase::THINKING;
   if (residual_reply) {
     ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
-             phase_name_(phase_now), (unsigned) this->audio_fill_);
-    this->send_interrupt();
+             phase_name_(phase_now), (unsigned) audio_fill_snapshot);
+    if (!this->send_interrupt()) {
+      this->session_starting_.store(false, std::memory_order_release);
+      this->streaming_.store(false, std::memory_order_release);
+      this->clear_mic_tx_();
+      this->fire_phase_led_("idle");
+      this->fail_control_channel_("residual interrupt failure");
+      ESP_LOGW(TAG, "start_session() aborted — prior turn was not cancelled");
+      return;
+    }
   }
 
-  // Discard (do NOT replay) the pre-roll captured before this session. The ring
-  // caught the wake chime leaking through the mic during the chime/tail-delay
-  // window; replaying it fed the chime back to OpenAI as a phantom "Au!". The
-  // mic task does the actual ring reset (its sole owner) when it sees this flag.
-  this->preroll_discard_pending_ = true;
-  ESP_LOGI(TAG, "start_session() — streaming on");
-  this->streaming_ = true;
-  // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
-  // the residual-reply interrupt above so the backend sees interrupt → wake in
-  // order. The first real mic frame for this turn doesn't flow until after this
-  // returns, so the guard's "speech since wake" tracker starts clean.
-  this->send_wake_();
-  // New wake word starts a fresh session — drop any pending or active
-  // follow-up window from the previous turn.
+  // A no-chime wake replays the rolling buffer to preserve a command spoken in
+  // the same breath as the wake word. Every other caller discards it so chime
+  // leakage or arbitrary pre-button room audio is never submitted as speech.
+  this->preroll_replay_pending_.store(replay_preroll, std::memory_order_release);
+  this->preroll_discard_pending_.store(!replay_preroll, std::memory_order_release);
+
+  // New wake word preempts every pending or active follow-up state from the
+  // previous turn, even if the control marker below cannot be delivered.
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
   this->request_follow_up_pending_ = false;
   this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
-  // A genuine new turn starts here — drop the post-stop `thinking` guard so
-  // this turn's `thinking` shows normally. (Set last, AFTER the residual-reply
-  // send_interrupt() above re-set it, so the wake always ends with it clear.)
+  // A genuine new turn starts here — drop the post-stop `thinking` guard. Set
+  // this after the residual-reply send_interrupt() above may have re-armed it.
   this->post_stop_guard_ = false;
+  this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
-  // Anchor turn-latency timestamps for the new turn.
+
+  // Initialize every state a fast server response might touch before sending
+  // the marker. Otherwise an early phase=listening could cancel no watchdog,
+  // only for us to install a fresh watchdog after it had already been heard.
   this->turn_t_wake_ = millis();
   this->turn_t_listening_ = 0;
   this->turn_t_thinking_ = 0;
   this->turn_t_first_audio_out_ = 0;
-  // Reset audio-quality detectors for this turn.
   this->last_binary_ms_ = 0;
   this->ws_gap_count_ = 0;
   this->ws_gap_max_ms_ = 0;
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
+
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
   // session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
     ESP_LOGI(TAG, "no speech detected for %u ms — aborting session",
              (unsigned) kNoSpeechTimeoutMs);
-    if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+    if (this->ws_connected_.load(std::memory_order_acquire) &&
+        this->ws_handle_ != nullptr) {
       const char m[] = "{\"type\":\"interrupt\"}";
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, m, sizeof(m) - 1, portMAX_DELAY);
+      const int sent = esp_websocket_client_send_text(
+          handle, m, sizeof(m) - 1, pdMS_TO_TICKS(kWsControlSendTimeoutMs));
+      if (sent != static_cast<int>(sizeof(m) - 1)) {
+        ESP_LOGW(TAG, "no-speech interrupt send failed (sent=%d expected=%u)",
+                 sent, (unsigned) (sizeof(m) - 1));
+        this->fail_control_channel_("no-speech interrupt failure");
+      }
     }
-    this->streaming_ = false;
+    this->streaming_.store(false, std::memory_order_release);
+    this->clear_mic_tx_();
     this->turn_t_wake_ = 0;
     // Force LED back to idle from yaml side.
     this->defer([this]() {
@@ -1024,6 +1404,33 @@ void VaClient::start_session() {
       }
     });
   });
+
+  // The producer may now queue pre-roll + live PCM, but drain_mic_tx_ remains
+  // gated by session_starting_. start_session_ and drain_mic_tx_ both run on
+  // ESPHome's main loop, while the flag safely coordinates the I2S/WS tasks.
+  this->streaming_.store(true, std::memory_order_release);
+  const bool wake_sent = this->send_wake_();
+  if (!wake_sent || this->session_starting_.load(std::memory_order_acquire) == 0) {
+    // Disconnect and server-error handlers clear session_starting_ while the
+    // bounded send is in flight. Treat that exactly like a failed send.
+    this->session_starting_.store(false, std::memory_order_release);
+    this->streaming_.store(false, std::memory_order_release);
+    this->clear_mic_tx_();
+    this->replay_enqueued_samples_.store(0, std::memory_order_relaxed);
+    this->preroll_replay_pending_.store(false, std::memory_order_release);
+    this->preroll_discard_pending_.store(true, std::memory_order_release);
+    this->cancel_timeout("va_no_speech");
+    this->turn_t_wake_ = 0;
+    this->fire_phase_led_("idle");
+    ESP_LOGW(TAG, "start_session() aborted — wake marker was not delivered");
+    if (!wake_sent)
+      this->fail_control_channel_("wake marker failure");
+    return;
+  }
+
+  this->session_starting_.store(false, std::memory_order_release);
+  ESP_LOGI(TAG, "start_session() — streaming on%s",
+           replay_preroll ? " (queued pre-roll armed)" : "");
 }
 
 void VaClient::open_followup_window_(uint32_t duration_ms) {
@@ -1074,7 +1481,8 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
     // original pipeline. Leave the mic closed; user must say a wake word
     // for the next turn. (The LED idle was already emitted above / by the
     // set_phase_ tail.)
-    this->streaming_ = false;
+    this->streaming_.store(false, std::memory_order_release);
+    this->clear_mic_tx_();
     return;
   }
   // Follow-up dialog window. We do NOT open the mic immediately: has_buffered_
@@ -1091,7 +1499,7 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
   ESP_LOGI(TAG, "follow-up: mic opens in %u ms, then listening for %u ms",
            (unsigned) open_delay, (unsigned) duration_ms);
   this->set_timeout("va_followup_open", open_delay, [this, duration_ms]() {
-    if (!this->ws_connected_) {
+    if (!this->ws_connected_.load(std::memory_order_acquire)) {
       // The reply drained into a dead connection (WS dropped mid-reply).
       // Opening the mic would show a "listening" LED while on_mic_data_
       // drops every frame — a window the user talks into for nothing.
@@ -1100,12 +1508,16 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       return;
     }
     ESP_LOGI(TAG, "follow-up window open (mic on, listening for %u ms)", (unsigned) duration_ms);
-    this->streaming_ = true;
+    this->clear_mic_tx_();
+    this->preroll_replay_pending_.store(false, std::memory_order_release);
+    this->preroll_discard_pending_.store(true, std::memory_order_release);
+    this->streaming_.store(true, std::memory_order_release);
     this->fire_phase_led_("listening");  // blue ring: user may answer now
     this->set_timeout("va_followup", duration_ms, [this]() {
-      if (this->streaming_) {
+      if (this->streaming_.load(std::memory_order_acquire)) {
         ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-        this->streaming_ = false;
+        this->streaming_.store(false, std::memory_order_release);
+        this->clear_mic_tx_();
         this->send_mic_flush_();        // drop any uncommitted partial utterance
         this->fire_phase_led_("idle");  // no answer came; back to idle
       }
@@ -1122,27 +1534,51 @@ void VaClient::send_mic_flush_() {
   // the server VAD and caused garbage commits). This timer only fires when the
   // user did NOT trigger speech — `listening` cancels va_followup — so it can
   // never drop a valid command. Cheap no-op when the buffer was empty.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+  if (this->ws_connected_.load(std::memory_order_acquire) &&
+      this->ws_handle_ != nullptr) {
     const char msg[] = "{\"type\":\"flush\"}";
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
-    ESP_LOGI(TAG, "follow-up window closed — sent flush (drop uncommitted mic audio)");
+    const uint32_t started_ms = millis();
+    const int sent = esp_websocket_client_send_text(
+        handle, msg, sizeof(msg) - 1, pdMS_TO_TICKS(kWsControlSendTimeoutMs));
+    const uint32_t elapsed_ms = millis() - started_ms;
+    if (sent == static_cast<int>(sizeof(msg) - 1)) {
+      ESP_LOGI(TAG, "follow-up window closed — sent flush in %u ms "
+                    "(drop uncommitted mic audio)",
+               (unsigned) elapsed_ms);
+    } else {
+      ESP_LOGW(TAG, "follow-up flush send failed in %u ms (sent=%d expected=%u)",
+               (unsigned) elapsed_ms, sent, (unsigned) (sizeof(msg) - 1));
+      this->fail_control_channel_("follow-up flush failure");
+    }
   }
 }
 
-void VaClient::send_wake_() {
+bool VaClient::send_wake_() {
   // Tell the backend a fresh wake started (dangling-VAD guard, A). Until the
   // user actually speaks this turn, OpenAI's server VAD can still fire an
   // end-of-turn for a PREVIOUS utterance that never closed (the reply gated the
   // mic mid-sentence) — committing it auto-creates a garbage answer to an empty
   // turn. The backend uses this signal to suppress that stale thinking + cancel
   // the racing response. Sent on every start_session(); old backends ignore it.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"wake\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
-    ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
+  if (!this->ws_connected_.load(std::memory_order_acquire) ||
+      this->ws_handle_ == nullptr) {
+    ESP_LOGW(TAG, "wake marker not sent — WS disconnected");
+    return false;
   }
+
+  const char msg[] = "{\"type\":\"wake\"}";
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  const int sent = esp_websocket_client_send_text(
+      handle, msg, sizeof(msg) - 1, pdMS_TO_TICKS(kWsControlSendTimeoutMs));
+  if (sent != static_cast<int>(sizeof(msg) - 1)) {
+    ESP_LOGW(TAG, "wake marker send failed (sent=%d expected=%u)", sent,
+             (unsigned) (sizeof(msg) - 1));
+    return false;
+  }
+
+  ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
+  return true;
 }
 
 void VaClient::fire_phase_led_(const std::string &phase) {
@@ -1169,32 +1605,51 @@ void VaClient::commit_followup_mic() {
     return;
   }
   this->followup_armed_ = false;
+  if (this->control_channel_dirty_.load(std::memory_order_acquire) ||
+      !this->ws_connected_.load(std::memory_order_acquire) ||
+      this->ws_handle_ == nullptr) {
+    ESP_LOGW(TAG, "commit_followup_mic: control channel unavailable, ignoring");
+    return;
+  }
   ESP_LOGI(TAG, "follow-up mic armed by yaml (window %u ms)",
            (unsigned) kRequestFollowUpMs);
   // Discard the pre-roll: the request_follow_up chime just played and leaked
   // into the ring; don't replay it to OpenAI. (Same "Au!" guard as the wake
   // path; consumed by the mic task on the next frame.)
-  this->preroll_discard_pending_ = true;
-  this->streaming_ = true;
+  this->clear_mic_tx_();
+  this->preroll_replay_pending_.store(false, std::memory_order_release);
+  this->preroll_discard_pending_.store(true, std::memory_order_release);
+  this->streaming_.store(true, std::memory_order_release);
   this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
-    if (this->streaming_) {
+    if (this->streaming_.load(std::memory_order_acquire)) {
       ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-      this->streaming_ = false;
+      this->streaming_.store(false, std::memory_order_release);
+      this->clear_mic_tx_();
       this->send_mic_flush_();  // drop any uncommitted partial utterance
     }
   });
 }
 
-void VaClient::send_interrupt() {
+bool VaClient::send_interrupt() {
   // Best-effort cancel to the backend — ONLY if the socket is alive. The local
   // cleanup below must ALWAYS run: returning early on a dead socket (the old
   // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
   // armed after a "stop" on a dead link, so the mic would resume streaming the
   // room the instant we reconnected.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
+  bool attempted = false;
+  bool delivered = false;
+  if (this->ws_connected_.load(std::memory_order_acquire) &&
+      this->ws_handle_ != nullptr) {
+    attempted = true;
     const char msg[] = "{\"type\":\"interrupt\"}";
     auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+    const int sent = esp_websocket_client_send_text(
+        handle, msg, sizeof(msg) - 1, pdMS_TO_TICKS(kWsControlSendTimeoutMs));
+    delivered = sent == static_cast<int>(sizeof(msg) - 1);
+    if (!delivered) {
+      ESP_LOGW(TAG, "interrupt send failed (sent=%d expected=%u)", sent,
+               (unsigned) (sizeof(msg) - 1));
+    }
   } else {
     ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
   }
@@ -1224,7 +1679,8 @@ void VaClient::send_interrupt() {
   // cancelled just below — mic open + streaming to OpenAI indefinitely, so any
   // later room speech becomes an unprompted turn. Callers that start a fresh
   // turn (start_session) re-open it themselves right after.
-  this->streaming_ = false;
+  this->streaming_.store(false, std::memory_order_release);
+  this->clear_mic_tx_();
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
   this->request_follow_up_pending_ = false;
@@ -1242,7 +1698,11 @@ void VaClient::send_interrupt() {
   // Cleared in start_session() (the next wake). See set_phase_.
   this->post_stop_guard_ = true;
   this->cancel_timeout("va_followup_open");
-  ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
+  if (attempted && !delivered)
+    this->fail_control_channel_("interrupt failure");
+  ESP_LOGI(TAG, "send_interrupt — WS msg %s, queue flushed",
+           delivered ? "sent" : "not sent");
+  return delivered;
 }
 
 }  // namespace va_client

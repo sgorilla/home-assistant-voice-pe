@@ -59,6 +59,9 @@ substitutions:
   # change this if your HA host has a different name/IP, e.g.
   # "ws://192.168.1.10:8080/".
   va_url: "ws://homeassistant.local:8080/"
+  # Lets a per-device stub test a va_client feature branch alongside the same
+  # package branch. Stable devices should leave this at main.
+  va_client_ref: main
   # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
 
 esphome:
@@ -1900,8 +1903,9 @@ external_components:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
-      url: https://github.com/xandervanerven/home-assistant-voice-pe
-      ref: main
+      # This fork carries va_client fixes that are not in the upstream repo.
+      url: https://github.com/sgorilla/home-assistant-voice-pe
+      ref: ${va_client_ref}
     components: [va_client]
     refresh: 0s
 
@@ -2088,13 +2092,12 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    # PERSONAL VARIANT: alexa-only start wake word (microWakeWord v2.1).
-    # The stock start words (okay_nabu / hey_jarvis / hey_mycroft) were
-    # removed on purpose. "stop" stays — it's the reliable barge-in/interrupt
-    # word, armed only while the assistant is replying (see on_phase below).
-    # The model releases moved from kahrendt/microWakeWord to OHF-Voice.
-    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/alexa.json
-      id: alexa
+    # TEMPORARY TEST VARIANT: use the stock Okay Nabu model so an Alexa Echo in
+    # the room does not respond during repeated wake/audio-transport trials.
+    # "stop" stays — it is the barge-in/interrupt word, armed only while the
+    # assistant is replying (see on_phase below).
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/stop/stop.json
       id: stop
       internal: true
@@ -2123,7 +2126,7 @@ micro_wake_word:
   # 'Stop', but VAD model doesn't" 3x in a row before finally accepting
   # (+1.5 s latency, long enough for OpenAI to win the turn race during the
   # follow-up window). Keep the gate (it still blocks non-speech noise
-  # triggers for "alexa") but make it easier to satisfy.
+  # triggers for the start wake word) but make it easier to satisfy.
   vad:
     probability_cutoff: 0.3
   on_wake_word_detected:
@@ -2296,7 +2299,19 @@ micro_wake_word:
                                         # 400 ms, which let the chime tail leak into
                                         # the fresh mic as a ghost turn (2026-06-12).
                                         - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
-                                  - lambda: 'id(va)->start_session();'
+                                        # Chime audio contaminated the rolling mic
+                                        # buffer, so use the discard path.
+                                        - lambda: 'id(va)->start_session();'
+                                      else:
+                                        # No wake chime: start immediately, but do not
+                                        # replay pre-detection audio. The full rolling
+                                        # buffer contains the wake word itself (observed
+                                        # as a ghost "Kein Abo!" turn). The nonblocking
+                                        # TX queue still retains every frame captured
+                                        # while the wake control marker is being sent;
+                                        # session_starting_ prevents those frames from
+                                        # draining before that marker.
+                                        - lambda: 'id(va)->start_session();'
                                   # Show "waiting for command" (blue spin) immediately on wake,
                                   # before the server VAD detects actual speech. va_client's
                                   # on_phase will overwrite to phase 3 (listening_for_command)
@@ -2316,21 +2331,26 @@ select:
       - Slightly sensitive
       - Moderately sensitive
       - Very sensitive
+      - Maximum sensitivity
     on_value:
       # Sets specific wake word probabilities computed for each particular model
       # Note probability cutoffs are set as a quantized uint8 value, each comment has the corresponding floating point cutoff
       # False Accepts per Hour values are tested against all units and channels from the Dinner Party Corpus.
-      # PERSONAL VARIANT: only the alexa@v2.1 model is built in now, so the
-      # three tiers just adjust its cutoff. Cutoffs are quantized uint8
+      # TEMPORARY TEST VARIANT: only okay_nabu@20241226.3 is built in, so these
+      # tiers adjust its cutoff. Cutoffs are quantized uint8
       # (round(probability * 255)); LOWER = more sensitive = more false
-      # accepts. Spacing mirrors the proven okay_nabu tiers.
+      # accepts. The first three values are the stock Voice PE thresholds.
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(alexa).set_probability_cutoff(217);   // ~0.85
+          id(okay_nabu).set_probability_cutoff(217);   // 0.85 -> 0.000 FAPH on DiPCo
         } else if (x == "Moderately sensitive") {
-          id(alexa).set_probability_cutoff(178);   // ~0.70
+          id(okay_nabu).set_probability_cutoff(176);   // 0.69 -> 0.376 FAPH on DiPCo
         } else if (x == "Very sensitive") {
-          id(alexa).set_probability_cutoff(140);   // ~0.55
+          id(okay_nabu).set_probability_cutoff(143);   // 0.56 -> 0.751 FAPH on DiPCo
+        } else if (x == "Maximum sensitivity") {
+          // Diagnostic tier for quiet/far-field voices. Keep opt-in: Okay Nabu
+          // has not been false-accept benchmarked at this cutoff.
+          id(okay_nabu).set_probability_cutoff(115);   // ~0.45
         }
 
 

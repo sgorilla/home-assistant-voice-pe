@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mic_tx_ring.h"
+
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
@@ -49,7 +51,9 @@ class VaClient : public Component {
     followup_opened_triggers_.push_back(t);
   }
 
-  bool is_connected() const { return ws_connected_; }
+  bool is_connected() const {
+    return ws_connected_.load(std::memory_order_acquire) != 0;
+  }
 
   // Delay (ms) the yaml wake handler waits after the wake chime before opening
   // the mic, so the chime's i2s/DAC tail can't leak into the fresh mic and
@@ -64,7 +68,12 @@ class VaClient : public Component {
 
   // YAML-callable actions.
   void start_session();
-  void send_interrupt();
+  // Opens a fresh session and replays the rolling mic pre-roll before live
+  // audio. Use only when no wake chime was played: the pre-roll is what makes
+  // a natural "wake word + command" utterance work, but a chime in that same
+  // buffer would be sent to the backend as speech.
+  void start_session_with_preroll();
+  bool send_interrupt();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
   // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
@@ -86,7 +95,15 @@ class VaClient : public Component {
  protected:
   void connect_();
   void schedule_reconnect_();
+  void fail_control_channel_(const char *operation);
+  void start_session_(bool replay_preroll);
   void on_mic_data_(const std::vector<uint8_t> &samples);
+  // The I2S callback must never perform network I/O: va_client is registered
+  // before microWakeWord, so blocking here withholds the same frame from wake
+  // inference. It only enqueues PCM; loop() drains one bounded WS chunk.
+  void clear_mic_tx_();
+  void drain_mic_tx_();
+  void log_mic_health_();
   // Tell the backend to drop any uncommitted mic audio NOW. Sent when the mic
   // gate closes mid-stream by TIMER (a follow-up window expiring) — a partial
   // utterance left in OpenAI's input buffer would otherwise be "completed" by a
@@ -98,10 +115,11 @@ class VaClient : public Component {
   // dangling-VAD guard: a server-VAD end-of-turn before the user speaks is a
   // stale pre-wake segment → backend suppresses its thinking + cancels its
   // garbage response. Sent on every start_session(); old backends ignore it.
-  void send_wake_();
+  bool send_wake_();
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
-  // ring while the session is closed; the ring is DISCARDED (not replayed) on
-  // session open — see preroll_discard_pending_.
+  // ring while the session is closed. A no-chime wake replays it so speech that
+  // overlaps wake-model detection latency is not clipped; chime/button paths
+  // discard it.
   void preroll_push_(const int16_t *data, size_t n);
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
@@ -120,7 +138,13 @@ class VaClient : public Component {
 
   // esp_websocket_client_handle_t kept opaque to avoid leaking esp-idf into the header.
   void *ws_handle_{nullptr};
-  bool ws_connected_{false};
+  // Xtensa GCC implements std::atomic<bool> through slower helper calls in
+  // some configurations. Aligned 32-bit atomics map to the native word size.
+  std::atomic<uint32_t> ws_connected_{0};
+  // No application control message may block an ESPHome task indefinitely.
+  // A failed bounded send is visible in logs and local cleanup still runs.
+  static constexpr uint32_t kWsControlSendTimeoutMs = 250;
+  std::atomic<uint32_t> control_channel_dirty_{0};
 
   uint32_t reconnect_delay_ms_{1000};
   // Set when a reconnect timer is in flight. esp_websocket_client emits both
@@ -166,28 +190,67 @@ class VaClient : public Component {
 
   // Mic pre-roll ring (int16 mono @ kMicSampleRate), allocated in PSRAM. The
   // rolling ring continuously retains the most recent kPreRollMs of mic audio
-  // while the session is closed. We DO NOT replay it on session open: during
-  // the wake-chime + tail-delay window the ring inevitably captures the chime
-  // leaking through the mic (XMOS AEC leaves ~10x), and replaying it fed the
-  // chime back to OpenAI as a phantom utterance ("Au!"). Instead, on session
-  // open we DISCARD the ring (preroll_discard_pending_), matching marcinnowak79
-  // gemini_proxy's ring_buffer_->reset() on start. Trade-off: a word spoken
-  // *during* the chime is lost; the user speaks once the listening ring lights.
+  // while the session is closed. No-chime wake-word sessions replay it so a
+  // command spoken immediately after the wake word survives the model's
+  // detection latency. Chime/button/follow-up sessions discard it: during a
+  // chime the ring captures speaker leakage (XMOS AEC leaves ~10x), and an
+  // arbitrary button press must not submit speech from before the press.
   // Touched ONLY by the mic task (on_mic_data_) — no lock needed.
   // preroll_discard_pending_ is set by start_session()/commit_followup_mic()
-  // (main loop) and consumed by the mic task: a plain bool like streaming_.
+  // (main loop) and consumed by the mic task, so both handoff flags are atomic.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
   static constexpr uint32_t kPreRollMs = 600;
   int16_t *preroll_buf_{nullptr};
   size_t preroll_capacity_samples_{0};
   size_t preroll_head_{0};   // next write index
   size_t preroll_count_{0};  // valid samples (<= capacity)
-  bool preroll_discard_pending_{false};
+  std::atomic<uint32_t> preroll_discard_pending_{0};
+  std::atomic<uint32_t> preroll_replay_pending_{0};
+
+  // Outbound microphone PCM queue. The I2S task is the sole producer and the
+  // main ESPHome loop is the sole consumer. A lock protects the ring indices
+  // plus session-boundary clears that can also originate on the WS task.
+  // Two seconds provides 1.4 seconds of live-audio headroom after the 600 ms
+  // pre-roll without consuming meaningful space on the Voice PE's 8 MB PSRAM.
+  static constexpr size_t kMicTxBufferBytes = 64 * 1024;
+  // Match the pinned WebSocket transport's 1024-byte buffer. One send per loop
+  // prevents a replay burst while still draining substantially faster than the
+  // 32 kB/s mono PCM producer under normal LAN conditions.
+  static constexpr size_t kMicTxSendChunkBytes = 1024;
+  uint8_t *mic_tx_storage_{nullptr};
+  uint8_t *mic_tx_send_buf_{nullptr};
+  MicTxRing mic_tx_ring_;
+  portMUX_TYPE mic_tx_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  // Incremented on every queue clear. A callback snapshots this before doing
+  // any work and validates it under the queue lock, preventing a frame that
+  // began in an old session from being enqueued after a boundary clear.
+  std::atomic<uint32_t> mic_tx_generation_{0};
+  size_t mic_tx_high_water_bytes_{0};
+  std::atomic<uint32_t> mic_tx_dropped_bytes_{0};
+  uint32_t mic_tx_send_failures_{0};
+  uint32_t mic_tx_send_max_us_{0};
+  std::atomic<uint32_t> replay_enqueued_samples_{0};
+  // True only while start_session_ is synchronously placing the wake control
+  // marker on the socket. PCM may accumulate in the queue during this state,
+  // but drain_mic_tx_ cannot transmit it and stale server phases are ignored.
+  std::atomic<uint32_t> session_starting_{0};
+
+  // Low-rate evidence that the physical I2S callback remains alive. These
+  // counters let a future failure distinguish raw-mic starvation from a live
+  // microphone feeding a stalled wake-inference task.
+  std::atomic<uint32_t> mic_callback_count_{0};
+  std::atomic<uint32_t> last_mic_callback_ms_{0};
+  std::atomic<uint32_t> mic_callback_max_us_{0};
+  std::atomic<uint32_t> mic_signal_peak_{0};
+  std::atomic<uint32_t> mic_zero_frame_count_{0};
+  uint32_t last_mic_health_log_ms_{0};
+  uint32_t last_mic_health_callback_count_{0};
+  static constexpr uint32_t kMicHealthLogMs = 5000;
 
   // Streaming gate. True while the mic should be forwarded to the server:
   //   - between wake-word start_session() and "listening"/"thinking"
   //   - and again after "idle" for kFollowupMs (in case AI asked a question)
-  bool streaming_{false};
+  std::atomic<uint32_t> streaming_{0};
   // Handsfree barge-in toggle, set from yaml (`barge_in:`). See set_barge_in().
   bool barge_in_{true};
   // Set on phase=idle when there's still TTS audio queued — we can't open
@@ -273,8 +336,8 @@ class VaClient : public Component {
   static constexpr uint32_t kPlaybackPrebufferMaxMs = 2000;
   static constexpr uint32_t kPlaybackSampleRate = 24000;  // incoming TTS PCM rate
   // True while we're accumulating the prebuffer cushion (holding playback).
-  // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
-  // plain flag like streaming_, the tiny race is harmless.
+  // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases).
+  // This pre-existing best-effort playback flag is unrelated to the mic gate.
   bool playback_priming_{false};
   // millis() when priming started (first byte after the ring was empty); used
   // for the prime deadline so real-time (non-burst) audio still starts promptly.
