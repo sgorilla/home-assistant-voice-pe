@@ -92,15 +92,28 @@ The same pinned 20-step closed-loop oracle was run on each physical image:
 
 For this graph, dependency revision, and ESP32-S3 target, the bisection isolates
 the arithmetic divergence to the optimized AveragePool2D path. The final
-selective image is the durable measurement policy. A complete 10,000-inference
-performance report for that exact final image is still pending and must not be
-inferred from an earlier build's report.
+selective image is the durable measurement policy.
+
+The final selective image subsequently completed a 10,000-inference physical
+runtime window (cumulative invocation count 200,000): p50 16.5 ms, p95 17.5 ms,
+p99 18.0 ms, maximum 48.965 ms, and 3/10,000 invocations over the 30 ms runtime
+budget. The percentile buckets were not censored, no report was dropped, and
+`ring_full_total` remained zero. The maximum observed invocation-start gap was
+40.699 ms. The raw cadence counter classified 7,485/9,997 intervals as greater
+than exactly 30,000 us; because that threshold has no scheduling tolerance, it
+must not be interpreted as 7,485 dropped feature windows. This was a quiet/idle
+runtime measurement, not a worst-load speech-plus-playback qualification.
 
 Physical speech confirms that the model can trigger the real wake/session path,
-but the candidate is not ready for promotion: the byte-183 operating point
-detected only about one of ten natural utterances in the first controlled
-positive sweep, with visibly stronger response to higher-pitched delivery.
-That is model/input-domain evidence, not a remaining kernel-parity failure.
+but the candidate is not ready for promotion. A rough activation sweep at the
+byte-183 operating point produced about one observed activation in ten intended
+utterances. A separate non-triggering score capture at byte 230 ranged from
+5/255 to 201/255; only two five-second aggregate windows exceeded byte 183.
+Higher-pitched delivery appeared more likely to score, but not reliably. A
+subsequent state-reset trial was inconclusive because the five intended
+utterances did not arrive at comparable microphone levels. These are
+model/input-domain and test-design findings, not remaining kernel-parity
+failures, and they do not support a final threshold choice.
 
 ## Intended model state
 

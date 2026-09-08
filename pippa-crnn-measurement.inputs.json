@@ -77,9 +77,33 @@
     "selective_policy_byte_exact": true,
     "selective_policy_invocations_per_5s_score_window": 167,
     "selective_policy_ring_reset_observed_in_capture": false,
-    "selective_policy_10000_inference_report_captured": false,
+    "selective_policy_10000_inference_report_captured": true,
+    "selective_policy_10000_inference_report": {
+      "samples": 10000,
+      "cumulative_invocations": 200000,
+      "runtime_budget_us": 30000,
+      "p50_bucket_us": 16500,
+      "p95_bucket_us": 17500,
+      "p99_bucket_us": 18000,
+      "runtime_max_us": 48965,
+      "runtime_budget_overruns": 3,
+      "cadence_intervals": 9997,
+      "cadence_threshold_us": 30000,
+      "cadence_max_gap_us": 40699,
+      "cadence_gap_over_threshold": 7485,
+      "percentile_censored_mask": 0,
+      "dropped_reports": 0,
+      "ring_full_total": 0,
+      "load_context": "quiet/idle; not worst-load speech plus playback"
+    },
     "natural_positive_sweep_detected_approx": 1,
     "natural_positive_sweep_attempted_approx": 10,
+    "nontriggering_score_capture_raw_range": [5, 201],
+    "nontriggering_score_capture_sliding_average_range": [4, 200],
+    "reset_controlled_positive_sweep": {
+      "result": "inconclusive",
+      "reason": "intended utterances did not arrive at comparable microphone peak levels"
+    },
     "production_ready": false
   },
   "off_device_validation_build": {
