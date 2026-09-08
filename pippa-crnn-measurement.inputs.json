@@ -1,0 +1,121 @@
+{
+  "schema_version": 2,
+  "purpose": "Pippa issue #19 physical feasibility build inputs; measurement only",
+  "production_promotion": false,
+  "firmware_parent": "8babb3414fab843b16af7a7d68418dbf637c6262",
+  "voice_kit_commit": "0579e7b9d8504264719c593474c85447253c9dc1",
+  "vad_model_source_commit": "9a72109cc935f77e34cf8ffe7b868155c37ec201",
+  "candidate": {
+    "path": "models/pippa/candidate-16x8.tflite",
+    "size_bytes": 165960,
+    "sha256": "5841499a1a0420d4910a2f6b24e9e29ff271f2abeff65c64fd64f7d61d9bd770"
+  },
+  "descriptor": {
+    "path": "models/pippa/pippa-16x8.json",
+    "sha256": "733ecd2e44c06fb6e4ecaf8364337558e2b6fea5d070dd1b70a7b687a5bcb2d2",
+    "cutoff_byte": 183,
+    "sliding_window_size": 5,
+    "feature_step_ms": 10
+  },
+  "micro_wake_word_overlay": {
+    "reviewed_source_commit": "2ae0523c21d7c2aa68bffc1e73f86e6c62b458da",
+    "reviewed_baseline_files": {
+      "__init__.py": "6c954548a74508baa6a9b708e976905d96a08518b941a1dec4d2380fce399a52",
+      "automation.h": "3efba2558dab2ed445beb0562892cdcd3655923eb22559931ccbd51a34ffa281",
+      "micro_wake_word.cpp": "418cee3b87dda0a97b4759461168ebfaff8b0d13e9d014554aee7f58047b28c6",
+      "micro_wake_word.h": "c02fb0e63391aeb4f201e1e49665d33e1e9831474e58bbbfc492e04b8ac8faeb",
+      "model_data.cpp": "1c9cd00efc2c93867caec7431baf4b7828d4e6797680d296ab1075bc03da273f",
+      "model_data.h": "6dfb8da8fc6928c02d3c93d7fd8e15c1af38da2facc6597b45917585ecfe4d65",
+      "preprocessor_settings.h": "683b3ecca1a10bd778f883a2465b4cd073e6674afddfc7ba66cd8c16acabf6eb",
+      "streaming_model.cpp": "c04156243b47539523ea2bde27ac529e1cf48b79d34cba07cc9926c19557cd58",
+      "streaming_model.h": "0c7b9f6bd0154c06b4ff6f4531a30057fc6d94bea71b1741a8a5c90a8c616208"
+    },
+    "measurement_instrumented_files": {
+      "__init__.py": "e8b38fdf54a4e5f076d15b36e001e5860338d291b820f60994f7b44829994c7b",
+      "automation.h": "3efba2558dab2ed445beb0562892cdcd3655923eb22559931ccbd51a34ffa281",
+      "micro_wake_word.cpp": "b78b008e9a885fa14ab341fe54b24515c924dc1efce52f6d93014f0b6b2f18c1",
+      "micro_wake_word.h": "9a14c40726b0d0440b5e63102fc44369ea52021dc2119cb3931496ff5de038ab",
+      "model_data.cpp": "1c9cd00efc2c93867caec7431baf4b7828d4e6797680d296ab1075bc03da273f",
+      "model_data.h": "6dfb8da8fc6928c02d3c93d7fd8e15c1af38da2facc6597b45917585ecfe4d65",
+      "preprocessor_settings.h": "683b3ecca1a10bd778f883a2465b4cd073e6674afddfc7ba66cd8c16acabf6eb",
+      "streaming_model.cpp": "d1c35205c297530170aa255cc198f16ca1ff78212b78c8be5fc26ac6b8895ffb",
+      "streaming_model.h": "c8295ceeba11f782c1308c0a88ed028687840abd3af9ec248e690605c661e1d1",
+      "pippa_crnn_self_test_vectors.h": "dc569079b1266d6c36fbc123fcc0692ac48d45987c6b30d5c02a9d41f21bec08"
+    },
+    "measurement_yaml_sha256": "151a956ba676dc76011fcdd966b7e4b076da2ca0855e0d3602e206ce67c9c94c"
+  },
+  "tflm": {
+    "registry_component": "espressif/esp-tflite-micro=1.3.3~1",
+    "upstream_commit": "78e5532e682d3863a3c2985c3a74eed0a9ebaa61",
+    "fork_repository": "https://github.com/sgorilla/esp-tflite-micro.git",
+    "math_kernel_commit": "5c2441292b07c9ee3a6286674d0036e38c32152e",
+    "fork_commit": "6e5817c54e0b325d9ebbda64d3a3f71034a9e9ba",
+    "stock_source_hashes": {
+      "tensorflow/lite/micro/kernels/fully_connected_common.cc": "388bf81053aac4ce6d031e4995631deebeda020b3e02a9a80351074ebcfa960d",
+      "tensorflow/lite/micro/kernels/esp_nn/fully_connected.cc": "c23b68b0dceb783a37fa9eda5c3a4c4b53ae8977abde0f8f32c67f7ae2acce98"
+    },
+    "target_portable_output_hashes": {
+      "tensorflow/lite/micro/kernels/fully_connected_common.cc": "a91b2f52731c28c0a3dd8bb6740f7a1780d6a70ab5b3ab0de36abb6b85edcc5a",
+      "tensorflow/lite/micro/kernels/esp_nn/fully_connected.cc": "3f2de506cf4a2bcc29c509744d20ef5671b74b595149bb587cd32f6028127b75"
+    },
+    "target_portable_patch_manifest_sha256": "b58d303de3ee92d8d6dc500ad6d3d879539f9bd8431b83e8b6cda13afbd2fb39",
+    "target_portable_generator_sha256": "8f7171c6ff5dab2cdb0c2ebfb8dbe2b58ee96feb99755c257f846ec754fb85ec",
+    "selective_kernel_policy": {
+      "cmake_sha256": "0a5c784ba88704504a75c39c2cb17c38e40361d79b3d6b83776fcdd3dfaf00d0",
+      "esp_nn_enabled_sources": [
+        "tensorflow/lite/micro/kernels/esp_nn/conv.cc",
+        "tensorflow/lite/micro/kernels/esp_nn/depthwise_conv.cc"
+      ],
+      "average_pool_uses_reference_fallback": true
+    }
+  },
+  "physical_canary": {
+    "target": "Home Assistant Voice Preview Edition / ESP32-S3",
+    "oracle_records": "184..203",
+    "oracle_probability_bytes_exact": 20,
+    "oracle_state_bytes_exact_per_step": 112,
+    "selective_policy_byte_exact": true,
+    "selective_policy_invocations_per_5s_score_window": 167,
+    "selective_policy_ring_reset_observed_in_capture": false,
+    "selective_policy_10000_inference_report_captured": true,
+    "selective_policy_10000_inference_report": {
+      "samples": 10000,
+      "cumulative_invocations": 200000,
+      "runtime_budget_us": 30000,
+      "p50_bucket_us": 16500,
+      "p95_bucket_us": 17500,
+      "p99_bucket_us": 18000,
+      "runtime_max_us": 48965,
+      "runtime_budget_overruns": 3,
+      "cadence_intervals": 9997,
+      "cadence_threshold_us": 30000,
+      "cadence_max_gap_us": 40699,
+      "cadence_gap_over_threshold": 7485,
+      "percentile_censored_mask": 0,
+      "dropped_reports": 0,
+      "ring_full_total": 0,
+      "load_context": "quiet/idle; not worst-load speech plus playback"
+    },
+    "natural_positive_sweep_detected_approx": 1,
+    "natural_positive_sweep_attempted_approx": 10,
+    "nontriggering_score_capture_raw_range": [5, 201],
+    "nontriggering_score_capture_sliding_average_range": [4, 200],
+    "reset_controlled_positive_sweep": {
+      "result": "inconclusive",
+      "reason": "intended utterances did not arrive at comparable microphone peak levels"
+    },
+    "production_ready": false
+  },
+  "off_device_validation_build": {
+    "flashable": false,
+    "credentials": "placeholders",
+    "target": "esp32s3",
+    "esphome_version": "2026.8.2",
+    "esp_idf_version": "5.5.5",
+    "ota_size_bytes": 3375840,
+    "ota_sha256": "34415508636484e2950189b0a93a8a7442380aa00973f5f0b96dc2b886d3d33e",
+    "diram_used_bytes": 176635,
+    "diram_total_bytes": 341760,
+    "app_partition_free_percent": 58
+  }
+}
