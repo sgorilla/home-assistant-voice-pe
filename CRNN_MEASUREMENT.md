@@ -19,13 +19,14 @@ except for the wake-model/runtime substitutions required by the measurement.
 - `va_client`: `8babb3414fab843b16af7a7d68418dbf637c6262`.
 - Voice-kit component: `0579e7b9d8504264719c593474c85447253c9dc1`.
 
-The descriptor's 200,000-byte tensor arena is an unmeasured fallback. Host
-fixture allocation and quality results are not physical Voice PE measurements.
+The descriptor's 200,000-byte tensor arena remains a conservative manifest
+fallback. Host fixture allocation and quality results are not substitutes for
+the separately reported physical Voice PE measurements.
 
 ## Build contract
 
 The build pins `sgorilla/esp-tflite-micro` commit
-`5c2441292b07c9ee3a6286674d0036e38c32152e`, derived from registry component
+`6e5817c54e0b325d9ebbda64d3a3f71034a9e9ba`, derived from registry component
 `espressif/esp-tflite-micro=1.3.3~1` at upstream commit
 `78e5532e682d3863a3c2985c3a74eed0a9ebaa61`. The functional patch started from
 these exact source hashes:
@@ -56,15 +57,50 @@ Its preparation manifest SHA-256 is
 the target-portable generator SHA-256 is
 `8f7171c6ff5dab2cdb0c2ebfb8dbe2b58ee96feb99755c257f846ec754fb85ec`.
 A minimal ESP32-S3 Xtensa build consumed those exact sources and passed. A
-complete Voice PE build then consumed the same target-portable bytes and passed
-under ESPHome 2026.8.2 / ESP-IDF 5.5.5. The off-device validation build used
-placeholder credentials and is deliberately not flashable: its 3,370,000-byte
+complete Voice PE build then consumed the same target-portable bytes and the
+selective kernel policy and passed under ESPHome 2026.8.2 / ESP-IDF 5.5.5. The
+off-device validation build used placeholder credentials and is deliberately
+not flashable: its 3,375,840-byte
 OTA image has SHA-256
-`e557c98f313739d8c84447970825fb3b5d189b0a93c5fb92886cb1c68532b1e1`.
-It used 174,979 of 341,760 linked DIRAM bytes (51.2%) and left 59% of the
-application partition free. The live ESPHome Builder must rebuild the same
-bound sources with its existing device credentials. Review and physical
-measurement remain required before any promotion.
+`34415508636484e2950189b0a93a8a7442380aa00973f5f0b96dc2b886d3d33e`.
+It used 176,635 of 341,760 linked DIRAM bytes (51.7%) and left 58% of the
+application partition free. The live ESPHome Builder rebuilt the bound sources
+with the existing device credentials for the physical canary.
+
+Commit `5c2441292b07c9ee3a6286674d0036e38c32152e` contains only the target-portable
+fully-connected math additions and their provenance. Its child commit
+`6e5817c54e0b325d9ebbda64d3a3f71034a9e9ba` records the physical kernel policy:
+only the Conv2D and DepthwiseConv2D wrappers receive `ESP_NN=1`; AveragePool2D
+and the remaining wrappers execute their reference fallbacks. The measurement
+runtime deliberately omits its former global `ESP_NN` build flag so it cannot
+override that per-source policy.
+
+## Physical kernel result
+
+The same pinned 20-step closed-loop oracle was run on each physical image:
+
+1. The stock all-ESP-NN image diverged from the expected probability/state
+   trajectory.
+2. The all-reference image matched all 20 probability bytes and all 112 state
+   bytes at every step, but roughly 45 ms invocations exceeded the 30 ms model
+   budget and repeatedly reset the microphone ring.
+3. Conv2D-only acceleration remained 20/20 byte-exact and restored real-time
+   processing.
+4. Conv2D plus DepthwiseConv2D acceleration also remained 20/20 byte-exact and
+   sustained 167 invocations per five-second score window without an observed
+   ring reset in the capture.
+
+For this graph, dependency revision, and ESP32-S3 target, the bisection isolates
+the arithmetic divergence to the optimized AveragePool2D path. The final
+selective image is the durable measurement policy. A complete 10,000-inference
+performance report for that exact final image is still pending and must not be
+inferred from an earlier build's report.
+
+Physical speech confirms that the model can trigger the real wake/session path,
+but the candidate is not ready for promotion: the byte-183 operating point
+detected only about one of ten natural utterances in the first controlled
+positive sweep, with visibly stronger response to higher-pitched delivery.
+That is model/input-domain evidence, not a remaining kernel-parity failure.
 
 ## Intended model state
 
@@ -80,12 +116,19 @@ disabling Okay Nabu explicitly. The Okay Nabu-specific sensitivity selector is
 removed from this fixed-cutoff measurement configuration so it cannot
 accidentally imply that it tunes Pippa.
 
-## First-flash metrics
+## Measurement instrumentation
 
-Only this measurement overlay defines `PIPPA_CRNN_METRICS`. For the external-
-state model, `CRNN_ARENA` reports the tensor and resource-variable arenas' used
-and allocated bytes once. `CRNN_PERF` is handed from the inference task to the
-main loop and logged after each 10,000 warm invocations; there is no per-invoke
+Only this measurement overlay defines `PIPPA_CRNN_METRICS` and
+`PIPPA_CRNN_SELF_TEST`. At boot, the self-test runs records 184 through 203 from
+the pinned host/reference trajectory before microphone inference starts. It
+retains results, recreates the interpreter so fixture state cannot leak into
+live inference, and reports from the main loop after logging is available.
+
+For the external-state model, `CRNN_ARENA` reports the tensor and
+resource-variable arenas' used and allocated bytes once. `CRNN_SCORE` reports a
+five-second aggregate of microphone peak, feature range/change, raw score, and
+sliding-average score. `CRNN_PERF` is handed from the inference task to the main
+loop and logged after each 10,000 warm invocations; there is no per-invoke
 logging or allocation.
 
 `runtime_*` measures only `MicroInterpreter::Invoke()` plus recurrent-state
@@ -106,3 +149,7 @@ greater than the separately logged `cadence_threshold_us` (30,000 us here).
 The previous-start anchor is cleared on every streaming-state reset, so an
 interval never crosses a known stream boundary. `ring_full_total` remains the
 cumulative count of rejected microphone chunks that triggered a ring reset.
+
+The Home Assistant diagnostic controls can change Pippa's cutoff or request a
+thread-safe recurrent-state reset without rebuilding. The cutoff is restored
+to the descriptor's byte-183 default after every reboot.
