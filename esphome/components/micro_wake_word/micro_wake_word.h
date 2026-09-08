@@ -146,6 +146,7 @@ class MicroWakeWord final : public Component
 
 #ifdef PIPPA_CRNN_METRICS
   std::atomic<uint32_t> crnn_ring_full_events_{0};
+  std::atomic<uint16_t> crnn_audio_peak_{0};
 #endif
 
   static void inference_task(void *params);

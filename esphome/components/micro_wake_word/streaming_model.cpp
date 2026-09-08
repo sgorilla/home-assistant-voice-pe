@@ -5,9 +5,14 @@
 
 #include "streaming_model.h"
 
+#ifdef PIPPA_CRNN_SELF_TEST
+#include "pippa_crnn_self_test_vectors.h"
+#endif
+
 #ifdef USE_ESP32
 
 #include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
 #ifdef PIPPA_CRNN_METRICS
@@ -21,6 +26,10 @@
 static const char *const TAG = "micro_wake_word";
 
 namespace esphome::micro_wake_word {
+
+#ifdef PIPPA_CRNN_SELF_TEST
+static constexpr uint32_t CRNN_SELF_TEST_REPORT_DELAY_MS = 20000;
+#endif
 
 namespace {
 
@@ -68,7 +77,7 @@ void WakeWordModel::log_model_config() {
                 "    - Wake Word: %s\n"
                 "      Probability cutoff: %.2f\n"
                 "      Sliding window size: %d",
-                this->wake_word_.c_str(), this->probability_cutoff_ / 255.0f, this->sliding_window_size_);
+                this->wake_word_.c_str(), this->get_probability_cutoff() / 255.0f, this->sliding_window_size_);
 }
 
 void VADModel::log_model_config() {
@@ -76,7 +85,7 @@ void VADModel::log_model_config() {
                 "    - VAD Model\n"
                 "      Probability cutoff: %.2f\n"
                 "      Sliding window size: %d",
-                this->probability_cutoff_ / 255.0f, this->sliding_window_size_);
+                this->get_probability_cutoff() / 255.0f, this->sliding_window_size_);
 }
 
 bool StreamingModel::load_model_() {
@@ -307,10 +316,16 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
       ++this->last_n_index_;
       if (this->last_n_index_ == this->sliding_window_size_)
         this->last_n_index_ = 0;
-      this->recent_streaming_probabilities_[this->last_n_index_] = this->read_probability_();
+      const uint8_t probability = this->read_probability_();
+      this->recent_streaming_probabilities_[this->last_n_index_] = probability;
+#ifdef PIPPA_CRNN_METRICS
+      if (this->state_input_ != nullptr) {
+        this->record_crnn_score_(probability);
+      }
+#endif
       this->unprocessed_probability_status_ = true;
     }
-    if (this->recent_streaming_probabilities_[this->last_n_index_] < this->probability_cutoff_) {
+    if (this->recent_streaming_probabilities_[this->last_n_index_] < this->get_probability_cutoff()) {
       // Only increment ignore windows if less than the probability cutoff; this forces the model to "cool-off" from a
       // previous detection and calling ``reset_probabilities`` so it avoids duplicate detections
       this->ignore_windows_ = std::min(this->ignore_windows_ + 1, 0);
@@ -319,7 +334,224 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
   return true;
 }
 
+#ifdef PIPPA_CRNN_SELF_TEST
+bool StreamingModel::run_crnn_boot_self_test() {
+  static_assert(crnn_self_test::INVOCATION_COUNT <= CRNN_SELF_TEST_MAX_STEPS,
+                "CRNN self-test result storage is too small");
+  static_assert(sizeof(crnn_self_test::EXPECTED_RAW_PROBABILITY) == crnn_self_test::INVOCATION_COUNT,
+                "CRNN self-test probability fixture length mismatch");
+  static_assert(sizeof(crnn_self_test::FINAL_EXPECTED_STATE) == crnn_self_test::STATE_BYTES,
+                "CRNN self-test final-state fixture length mismatch");
+  if (this->crnn_boot_self_test_done_) {
+    return this->crnn_boot_self_test_passed_;
+  }
+  this->crnn_boot_self_test_done_ = true;
+  this->crnn_boot_self_test_passed_ = false;
+  this->crnn_boot_self_test_steps_run_ = 0;
+  this->crnn_boot_self_test_report_index_ = 0;
+  this->crnn_boot_self_test_failure_reason_ = "none";
+
+  if (!this->load_model_()) {
+    this->crnn_boot_self_test_failure_reason_ = "load_failed";
+    this->unload_model();
+    this->crnn_boot_self_test_next_report_ms_ = millis() + CRNN_SELF_TEST_REPORT_DELAY_MS;
+    this->crnn_boot_self_test_report_ready_.store(true, std::memory_order_release);
+    return false;
+  }
+
+  const bool abi_ok = this->state_input_ != nullptr && this->state_output_ != nullptr &&
+                      this->feature_input_->bytes == crnn_self_test::FEATURE_BYTES &&
+                      this->state_input_->bytes == crnn_self_test::STATE_BYTES &&
+                      this->state_output_->bytes == crnn_self_test::STATE_BYTES &&
+                      this->probability_output_->type == kTfLiteInt8 && this->probability_output_->bytes == 1 &&
+                      this->probability_output_->params.scale == (1.0f / 256.0f) &&
+                      this->probability_output_->params.zero_point == INT8_MIN;
+  if (!abi_ok) {
+    this->crnn_boot_self_test_failure_reason_ = "abi_mismatch";
+    this->unload_model();
+    this->crnn_boot_self_test_next_report_ms_ = millis() + CRNN_SELF_TEST_REPORT_DELAY_MS;
+    this->crnn_boot_self_test_report_ready_.store(true, std::memory_order_release);
+    return false;
+  }
+
+  const uint8_t *first_record = crnn_self_test::CRNN_SELF_TEST_INPUT_RECORDS;
+  std::memcpy(tflite::GetTensorData<int8_t>(this->state_input_), first_record + crnn_self_test::FEATURE_BYTES,
+              crnn_self_test::STATE_BYTES);
+
+  bool passed = true;
+  for (size_t invocation = 0; invocation < crnn_self_test::INVOCATION_COUNT; ++invocation) {
+    CrnnSelfTestStepResult &result = this->crnn_boot_self_test_results_[this->crnn_boot_self_test_steps_run_++];
+    result.record = crnn_self_test::FIRST_RECORD + invocation;
+    result.expected_raw = crnn_self_test::EXPECTED_RAW_PROBABILITY[invocation];
+    result.expected_score = static_cast<uint8_t>(static_cast<unsigned>(result.expected_raw) + 128U);
+    result.invoke_ok = false;
+    result.feedback_ok = false;
+    result.passed = false;
+
+    const uint8_t *record = crnn_self_test::CRNN_SELF_TEST_INPUT_RECORDS +
+                            invocation * crnn_self_test::INPUT_RECORD_BYTES;
+    std::memcpy(tflite::GetTensorData<int8_t>(this->feature_input_), record, crnn_self_test::FEATURE_BYTES);
+
+    if (this->interpreter_->Invoke() != kTfLiteOk) {
+      this->crnn_boot_self_test_failure_reason_ = "invoke_failed";
+      passed = false;
+      break;
+    }
+    result.invoke_ok = true;
+
+    result.actual_raw = static_cast<uint8_t>(this->probability_output_->data.int8[0]);
+    result.actual_score = this->read_probability_();
+
+    if (!this->feed_back_streaming_state_()) {
+      this->crnn_boot_self_test_failure_reason_ = "feedback_failed";
+      passed = false;
+      break;
+    }
+    result.feedback_ok = true;
+
+    const uint8_t *expected_state;
+    if (invocation + 1 < crnn_self_test::INPUT_RECORD_COUNT) {
+      const uint8_t *next_record = record + crnn_self_test::INPUT_RECORD_BYTES;
+      expected_state = next_record + crnn_self_test::FEATURE_BYTES;
+    } else {
+      expected_state = crnn_self_test::FINAL_EXPECTED_STATE;
+    }
+    const int8_t *actual_state = tflite::GetTensorData<int8_t>(this->state_input_);
+    result.state_exact = 0;
+    result.state_within_one = 0;
+    result.state_max_abs_diff = 0;
+    for (size_t state_index = 0; state_index < crnn_self_test::STATE_BYTES; ++state_index) {
+      int8_t expected_signed;
+      std::memcpy(&expected_signed, &expected_state[state_index], sizeof(expected_signed));
+      const bool byte_exact = static_cast<uint8_t>(actual_state[state_index]) == expected_state[state_index];
+      const uint8_t absolute_difference = static_cast<uint8_t>(std::abs(
+          static_cast<int>(actual_state[state_index]) - static_cast<int>(expected_signed)));
+      if (byte_exact) {
+        ++result.state_exact;
+      }
+      if (absolute_difference <= 1) {
+        ++result.state_within_one;
+      }
+      result.state_max_abs_diff = std::max(result.state_max_abs_diff, absolute_difference);
+    }
+
+    result.passed = result.actual_raw == result.expected_raw && result.state_exact == crnn_self_test::STATE_BYTES;
+    passed = passed && result.passed;
+  }
+
+  // Recreate the interpreter before live audio so the self-test cannot leave recurrent
+  // or interpreter state in the measurement run. CPU caches may remain warm briefly.
+  this->unload_model();
+  this->crnn_boot_self_test_passed_ = passed;
+  if (!passed && std::strcmp(this->crnn_boot_self_test_failure_reason_, "none") == 0) {
+    this->crnn_boot_self_test_failure_reason_ = "byte_mismatch";
+  }
+  this->crnn_boot_self_test_next_report_ms_ = millis() + CRNN_SELF_TEST_REPORT_DELAY_MS;
+  this->crnn_boot_self_test_report_ready_.store(true, std::memory_order_release);
+  return passed;
+}
+
+void StreamingModel::report_crnn_boot_self_test() {
+  if (!this->crnn_boot_self_test_report_ready_.load(std::memory_order_acquire)) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now < this->crnn_boot_self_test_next_report_ms_) {
+    return;
+  }
+
+  if (this->crnn_boot_self_test_report_index_ < this->crnn_boot_self_test_steps_run_) {
+    const CrnnSelfTestStepResult &result =
+        this->crnn_boot_self_test_results_[this->crnn_boot_self_test_report_index_++];
+    ESP_LOGI(TAG,
+             "CRNN_SELFTEST record=%u invoke_ok=%u feedback_ok=%u expected_raw=%u actual_raw=%u "
+             "expected_score=%u actual_score=%u state_exact=%u/%zu state_within1=%u/%zu "
+             "state_max_abs_diff=%u passed=%u",
+             static_cast<unsigned>(result.record), static_cast<unsigned>(result.invoke_ok),
+             static_cast<unsigned>(result.feedback_ok), static_cast<unsigned>(result.expected_raw),
+             static_cast<unsigned>(result.actual_raw), static_cast<unsigned>(result.expected_score),
+             static_cast<unsigned>(result.actual_score), static_cast<unsigned>(result.state_exact),
+             crnn_self_test::STATE_BYTES, static_cast<unsigned>(result.state_within_one),
+             crnn_self_test::STATE_BYTES, static_cast<unsigned>(result.state_max_abs_diff),
+             static_cast<unsigned>(result.passed));
+    this->crnn_boot_self_test_next_report_ms_ = now + 200;
+    return;
+  }
+
+  ESP_LOGI(TAG, "CRNN_SELFTEST_RESULT passed=%u records=%zu first=%zu last=%zu reason=%s",
+           static_cast<unsigned>(this->crnn_boot_self_test_passed_), this->crnn_boot_self_test_steps_run_,
+           crnn_self_test::FIRST_RECORD,
+           crnn_self_test::FIRST_RECORD +
+               (this->crnn_boot_self_test_steps_run_ == 0 ? 0 : this->crnn_boot_self_test_steps_run_ - 1),
+           this->crnn_boot_self_test_failure_reason_);
+  this->crnn_boot_self_test_report_ready_.store(false, std::memory_order_release);
+}
+#endif
+
 #ifdef PIPPA_CRNN_METRICS
+void StreamingModel::record_crnn_score_(uint8_t probability) {
+  this->crnn_score_raw_max_ = std::max(this->crnn_score_raw_max_, probability);
+
+  const int8_t *feature_data = tflite::GetTensorData<int8_t>(this->feature_input_);
+  uint32_t input_sum = 0;
+  uint8_t input_byte_max = 0;
+  for (size_t i = 0; i < this->feature_input_->bytes; ++i) {
+    const uint8_t rebased = static_cast<uint8_t>(static_cast<int16_t>(feature_data[i]) - INT8_MIN);
+    input_sum += rebased;
+    input_byte_max = std::max(input_byte_max, rebased);
+  }
+  const uint8_t input_mean = static_cast<uint8_t>(input_sum / this->feature_input_->bytes);
+  this->crnn_input_byte_max_ = std::max(this->crnn_input_byte_max_, input_byte_max);
+  this->crnn_input_mean_min_ = std::min(this->crnn_input_mean_min_, input_mean);
+  this->crnn_input_mean_max_ = std::max(this->crnn_input_mean_max_, input_mean);
+
+  if (this->feature_input_->bytes == this->crnn_previous_feature_input_.size()) {
+    if (this->crnn_previous_feature_input_valid_) {
+      uint32_t delta_l1 = 0;
+      for (size_t i = 0; i < this->feature_input_->bytes; ++i) {
+        delta_l1 += static_cast<uint32_t>(
+            std::abs(static_cast<int>(feature_data[i]) - static_cast<int>(this->crnn_previous_feature_input_[i])));
+      }
+      this->crnn_input_delta_l1_max_ = std::max(this->crnn_input_delta_l1_max_, delta_l1);
+    }
+    std::memcpy(this->crnn_previous_feature_input_.data(), feature_data, this->feature_input_->bytes);
+    this->crnn_previous_feature_input_valid_ = true;
+  } else {
+    this->crnn_previous_feature_input_valid_ = false;
+  }
+
+  uint32_t sum = 0;
+  for (const auto recent_probability : this->recent_streaming_probabilities_) {
+    sum += recent_probability;
+  }
+  const uint8_t sliding_average = static_cast<uint8_t>(sum / this->sliding_window_size_);
+  this->crnn_score_sliding_average_max_ = std::max(this->crnn_score_sliding_average_max_, sliding_average);
+  ++this->crnn_score_samples_;
+
+  if (this->crnn_score_samples_ < CRNN_SCORE_REPORT_SAMPLES) {
+    return;
+  }
+
+  if (!this->crnn_score_snapshot_pending_.load(std::memory_order_acquire)) {
+    this->crnn_score_snapshot_.samples = this->crnn_score_samples_;
+    this->crnn_score_snapshot_.raw_max = this->crnn_score_raw_max_;
+    this->crnn_score_snapshot_.sliding_average_max = this->crnn_score_sliding_average_max_;
+    this->crnn_score_snapshot_.input_byte_max = this->crnn_input_byte_max_;
+    this->crnn_score_snapshot_.input_mean_min = this->crnn_input_mean_min_;
+    this->crnn_score_snapshot_.input_mean_max = this->crnn_input_mean_max_;
+    this->crnn_score_snapshot_.input_delta_l1_max = this->crnn_input_delta_l1_max_;
+    this->crnn_score_snapshot_pending_.store(true, std::memory_order_release);
+  }
+
+  this->crnn_score_samples_ = 0;
+  this->crnn_score_raw_max_ = 0;
+  this->crnn_score_sliding_average_max_ = 0;
+  this->crnn_input_byte_max_ = 0;
+  this->crnn_input_mean_min_ = UINT8_MAX;
+  this->crnn_input_mean_max_ = 0;
+  this->crnn_input_delta_l1_max_ = 0;
+}
+
 uint32_t StreamingModel::crnn_percentile_bucket_(uint32_t numerator, uint8_t censored_bit,
                                                  uint8_t *censored_mask) const {
   const uint32_t target = (this->crnn_runtime_samples_ * numerator + 99U) / 100U;
@@ -419,6 +651,15 @@ bool StreamingModel::take_crnn_metrics_snapshot(CrnnRuntimeMetricsSnapshot *snap
   }
   *snapshot = this->crnn_metrics_snapshot_;
   this->crnn_metrics_snapshot_pending_.store(false, std::memory_order_release);
+  return true;
+}
+
+bool StreamingModel::take_crnn_score_snapshot(CrnnScoreMetricsSnapshot *snapshot) {
+  if (!this->crnn_score_snapshot_pending_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  *snapshot = this->crnn_score_snapshot_;
+  this->crnn_score_snapshot_pending_.store(false, std::memory_order_release);
   return true;
 }
 #endif
@@ -532,6 +773,7 @@ void StreamingModel::apply_streaming_state_reset_() {
 #ifdef PIPPA_CRNN_METRICS
   // A model-context reset is a real stream boundary, so the next invoke has no valid predecessor interval.
   this->crnn_previous_invoke_start_us_ = 0;
+  this->crnn_previous_feature_input_valid_ = false;
 #endif
 
   if (this->state_input_ == nullptr) {
@@ -602,7 +844,7 @@ WakeWordModel::WakeWordModel(const std::string &id, const uint8_t *model_start, 
   this->id_ = id;
   this->model_start_ = model_start;
   this->default_probability_cutoff_ = default_probability_cutoff;
-  this->probability_cutoff_ = default_probability_cutoff;
+  this->probability_cutoff_.store(default_probability_cutoff, std::memory_order_relaxed);
   this->sliding_window_size_ = sliding_window_average_size;
   this->recent_streaming_probabilities_.resize(sliding_window_average_size, 0);
   this->wake_word_ = wake_word;
@@ -636,7 +878,7 @@ WakeWordModel::WakeWordModel(const std::string &id, std::shared_ptr<ModelData> m
     ESP_LOGE(TAG, "Model '%s' has no valid data and will not be loaded", id.c_str());
   }
   this->default_probability_cutoff_ = default_probability_cutoff;
-  this->probability_cutoff_ = default_probability_cutoff;
+  this->probability_cutoff_.store(default_probability_cutoff, std::memory_order_relaxed);
   this->sliding_window_size_ = sliding_window_average_size;
   this->recent_streaming_probabilities_.resize(sliding_window_average_size, 0);
   this->wake_word_ = wake_word;
@@ -691,7 +933,7 @@ DetectionEvent WakeWordModel::determine_detected() {
   }
 
   detection_event.average_probability = sum / this->sliding_window_size_;
-  detection_event.detected = sum > this->probability_cutoff_ * this->sliding_window_size_;
+  detection_event.detected = sum > this->get_probability_cutoff() * this->sliding_window_size_;
 
   this->unprocessed_probability_status_ = false;
   return detection_event;
@@ -701,7 +943,7 @@ VADModel::VADModel(const uint8_t *model_start, uint8_t default_probability_cutof
                    size_t tensor_arena_size) {
   this->model_start_ = model_start;
   this->default_probability_cutoff_ = default_probability_cutoff;
-  this->probability_cutoff_ = default_probability_cutoff;
+  this->probability_cutoff_.store(default_probability_cutoff, std::memory_order_relaxed);
   this->sliding_window_size_ = sliding_window_size;
   this->recent_streaming_probabilities_.resize(sliding_window_size, 0);
   this->tensor_arena_size_ = tensor_arena_size;
@@ -726,7 +968,7 @@ DetectionEvent VADModel::determine_detected() {
   }
 
   detection_event.average_probability = sum / this->sliding_window_size_;
-  detection_event.detected = sum > (this->probability_cutoff_ * this->sliding_window_size_);
+  detection_event.detected = sum > (this->get_probability_cutoff() * this->sliding_window_size_);
 
   return detection_event;
 }

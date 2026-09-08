@@ -545,7 +545,9 @@ async def to_code(config):
 
     cg.add_build_flag("-DTF_LITE_STATIC_MEMORY")
     cg.add_build_flag("-DTF_LITE_DISABLE_X86_NEON")
-    cg.add_build_flag("-DESP_NN")
+    # The pinned measurement dependency enables only the byte-exact Conv2D and
+    # DepthwiseConv2D ESP-NN paths. A global define would also re-enable the
+    # divergent AveragePool2D path.
 
     if vad_model := config.get(CONF_VAD):
         cg.add_define("USE_MICRO_WAKE_WORD_VAD")

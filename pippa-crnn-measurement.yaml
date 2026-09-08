@@ -5,9 +5,9 @@
 # (8babb3414fab843b16af7a7d68418dbf637c6262). Build it from this checkout so
 # the local external component and model paths resolve to the reviewed bytes.
 #
-# The TFLM dependency is pinned to the target-portable feature commit in the
-# project fork. That commit is derived from the exact source behind
-# espressif/esp-tflite-micro 1.3.3~1.
+# The TFLM dependency is pinned to the target-portable math changes plus the
+# physically validated selective ESP-NN policy in the project fork. That stack
+# is derived from the exact source behind espressif/esp-tflite-micro 1.3.3~1.
 
 substitutions:
   name: pippa-crnn-measurement
@@ -30,6 +30,7 @@ esphome:
     version: "0.0.1"
   build_flags:
     - -DPIPPA_CRNN_METRICS
+    - -DPIPPA_CRNN_SELF_TEST
 
 esp32:
   framework:
@@ -38,7 +39,7 @@ esp32:
     components:
       - name: espressif/esp-tflite-micro
         source: https://github.com/sgorilla/esp-tflite-micro.git
-        ref: 5c2441292b07c9ee3a6286674d0036e38c32152e
+        ref: 6e5817c54e0b325d9ebbda64d3a3f71034a9e9ba
 
 external_components:
   - source:
@@ -48,6 +49,15 @@ external_components:
       - micro_wake_word
 
 micro_wake_word:
+  # MEASUREMENT ONLY: compare the XMOS channel-0 AGC stream against the stock
+  # channel-1 NS stream (which normally has fixed x4 gain). Live telemetry on
+  # channel 1 showed ordinary speech at only 119..635 PCM codes after gain,
+  # while channel 0 simultaneously reached 9,778..26,399. Keep channel-0 gain
+  # at 1 to avoid clipping the already-AGC'd stream.
+  microphone:
+    microphone: i2s_mics
+    channels: 0
+    gain_factor: 1
   # Pin the VAD asset that accompanied the reviewed ESPHome 2026.8.2 runtime
   # proof instead of resolving the mutable model-repository main branch.
   vad:
@@ -82,3 +92,32 @@ api:
 # operating-point measurement so it cannot imply that it adjusts Pippa.
 select:
   - id: !remove wake_word_sensitivity
+
+# Measurement-only control so a score-informed cutoff sweep does not require
+# another firmware rebuild. The model descriptor remains the authoritative
+# 0.718 default on every reboot.
+number:
+  - platform: template
+    id: pippa_measurement_cutoff
+    name: "Pippa measurement cutoff"
+    min_value: 0.10
+    max_value: 0.90
+    step: 0.01
+    initial_value: 0.717647
+    restore_value: false
+    optimistic: true
+    entity_category: diagnostic
+    on_value:
+      - lambda: |-
+          id(pippa).set_probability_cutoff(static_cast<uint8_t>(x * 255.0f + 0.5f));
+
+# A thread-safe recurrent-state reset for distinguishing a live state attractor
+# from a frontend-domain mismatch without rebooting or rebuilding.
+button:
+  - platform: template
+    id: pippa_measurement_reset_context
+    name: "Pippa measurement reset context"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(pippa).reset_streaming_state();

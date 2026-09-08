@@ -36,6 +36,22 @@ struct DetectionEvent {
   bool blocked_by_vad = false;
 };
 
+#ifdef PIPPA_CRNN_SELF_TEST
+struct CrnnSelfTestStepResult {
+  uint16_t record;
+  uint8_t expected_raw;
+  uint8_t actual_raw;
+  uint8_t expected_score;
+  uint8_t actual_score;
+  uint8_t state_exact;
+  uint8_t state_within_one;
+  uint8_t state_max_abs_diff;
+  bool invoke_ok;
+  bool feedback_ok;
+  bool passed;
+};
+#endif
+
 #ifdef PIPPA_CRNN_METRICS
 struct CrnnRuntimeMetricsSnapshot {
   uint32_t samples;
@@ -57,6 +73,16 @@ struct CrnnRuntimeMetricsSnapshot {
   uint32_t dropped_reports;
   uint8_t percentile_censored_mask;
 };
+
+struct CrnnScoreMetricsSnapshot {
+  uint32_t samples;
+  uint8_t raw_max;
+  uint8_t sliding_average_max;
+  uint8_t input_byte_max;
+  uint8_t input_mean_min;
+  uint8_t input_mean_max;
+  uint32_t input_delta_l1_max;
+};
 #endif
 
 class StreamingModel {
@@ -74,9 +100,21 @@ class StreamingModel {
   // Returns true if sucessful or false if there is an error
   bool perform_streaming_inference(const int8_t features[PREPROCESSOR_FEATURE_SIZE], uint32_t feature_step_us);
 
+#ifdef PIPPA_CRNN_SELF_TEST
+  /// Runs the pinned measurement candidate's known closed-loop trajectory once per boot.
+  /// The caller must own the inference task and must not have started the microphone source.
+  bool run_crnn_boot_self_test();
+
+  /// Emits retained self-test results from the main loop after API logging is available.
+  void report_crnn_boot_self_test();
+#endif
+
 #ifdef PIPPA_CRNN_METRICS
   /// Copies a complete 10,000-invocation CRNN metrics window from the inference task to the main loop.
   bool take_crnn_metrics_snapshot(CrnnRuntimeMetricsSnapshot *snapshot);
+
+  /// Copies a short CRNN score window from the inference task to the main loop.
+  bool take_crnn_score_snapshot(CrnnScoreMetricsSnapshot *snapshot);
 #endif
 
   /// @brief Sets all recent_streaming_probabilities to 0 and resets the ignore window count
@@ -111,8 +149,10 @@ class StreamingModel {
 
   // Quantized probability cutoffs mapping 0.0 - 1.0 to 0 - 255
   uint8_t get_default_probability_cutoff() const { return this->default_probability_cutoff_; }
-  uint8_t get_probability_cutoff() const { return this->probability_cutoff_; }
-  void set_probability_cutoff(uint8_t probability_cutoff) { this->probability_cutoff_ = probability_cutoff; }
+  uint8_t get_probability_cutoff() const { return this->probability_cutoff_.load(std::memory_order_relaxed); }
+  void set_probability_cutoff(uint8_t probability_cutoff) {
+    this->probability_cutoff_.store(probability_cutoff, std::memory_order_relaxed);
+  }
 
  protected:
   /// @brief Allocates tensor and variable arenas and sets up the model interpreter
@@ -145,7 +185,7 @@ class StreamingModel {
   int16_t ignore_windows_{-MIN_SLICES_BEFORE_DETECTION};
 
   uint8_t default_probability_cutoff_;
-  uint8_t probability_cutoff_;
+  std::atomic<uint8_t> probability_cutoff_{0};
   size_t sliding_window_size_;
 
   size_t last_n_index_{0};
@@ -163,13 +203,27 @@ class StreamingModel {
   TfLiteTensor *state_input_{nullptr};
   TfLiteTensor *state_output_{nullptr};
 
+#ifdef PIPPA_CRNN_SELF_TEST
+  static constexpr size_t CRNN_SELF_TEST_MAX_STEPS = 20;
+  bool crnn_boot_self_test_done_{false};
+  bool crnn_boot_self_test_passed_{false};
+  std::array<CrnnSelfTestStepResult, CRNN_SELF_TEST_MAX_STEPS> crnn_boot_self_test_results_{};
+  size_t crnn_boot_self_test_steps_run_{0};
+  size_t crnn_boot_self_test_report_index_{0};
+  uint32_t crnn_boot_self_test_next_report_ms_{0};
+  const char *crnn_boot_self_test_failure_reason_{"not_run"};
+  std::atomic<bool> crnn_boot_self_test_report_ready_{false};
+#endif
+
 #ifdef PIPPA_CRNN_METRICS
   static constexpr size_t CRNN_METRICS_BUCKET_COUNT = 128;
   static constexpr uint32_t CRNN_METRICS_BUCKET_US = 500;
   static constexpr uint32_t CRNN_METRICS_REPORT_SAMPLES = 10000;
+  static constexpr uint32_t CRNN_SCORE_REPORT_SAMPLES = 167;
 
   void record_crnn_cadence_(int64_t invoke_started_us, uint32_t expected_us);
   void record_crnn_runtime_(uint32_t elapsed_us, uint32_t expected_us);
+  void record_crnn_score_(uint8_t probability);
   uint32_t crnn_percentile_bucket_(uint32_t numerator, uint8_t censored_bit, uint8_t *censored_mask) const;
 
   std::array<uint16_t, CRNN_METRICS_BUCKET_COUNT> crnn_runtime_histogram_{};
@@ -190,6 +244,17 @@ class StreamingModel {
   bool crnn_arena_logged_{false};
   CrnnRuntimeMetricsSnapshot crnn_metrics_snapshot_{};
   std::atomic<bool> crnn_metrics_snapshot_pending_{false};
+  uint32_t crnn_score_samples_{0};
+  uint8_t crnn_score_raw_max_{0};
+  uint8_t crnn_score_sliding_average_max_{0};
+  uint8_t crnn_input_byte_max_{0};
+  uint8_t crnn_input_mean_min_{UINT8_MAX};
+  uint8_t crnn_input_mean_max_{0};
+  uint32_t crnn_input_delta_l1_max_{0};
+  std::array<int8_t, PREPROCESSOR_FEATURE_SIZE * 3> crnn_previous_feature_input_{};
+  bool crnn_previous_feature_input_valid_{false};
+  CrnnScoreMetricsSnapshot crnn_score_snapshot_{};
+  std::atomic<bool> crnn_score_snapshot_pending_{false};
 #endif
 };
 

@@ -15,6 +15,7 @@
 #include "esphome/components/audio/audio_transfer_buffer.h"
 
 #include <algorithm>
+#include <cstring>
 
 #ifdef USE_OTA
 #include "esphome/components/ota/ota_backend.h"
@@ -133,6 +134,21 @@ void MicroWakeWord::setup() {
     if (this->state_ == State::STOPPED) {
       return;
     }
+#ifdef PIPPA_CRNN_METRICS
+    uint16_t audio_peak = 0;
+    for (size_t offset = 0; offset + sizeof(int16_t) <= data.size(); offset += sizeof(int16_t)) {
+      int16_t sample;
+      std::memcpy(&sample, data.data() + offset, sizeof(sample));
+      const uint16_t magnitude = sample == INT16_MIN
+                                     ? static_cast<uint16_t>(32768U)
+                                     : static_cast<uint16_t>(sample < 0 ? -sample : sample);
+      audio_peak = std::max(audio_peak, magnitude);
+    }
+    uint16_t observed_peak = this->crnn_audio_peak_.load(std::memory_order_relaxed);
+    while (audio_peak > observed_peak &&
+           !this->crnn_audio_peak_.compare_exchange_weak(observed_peak, audio_peak, std::memory_order_relaxed)) {
+    }
+#endif
     std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
     if (this->ring_buffer_.use_count() > 1) {
       // Producer-only write: never touches consumer state. If the buffer is full, ask the inference task
@@ -192,6 +208,18 @@ void MicroWakeWord::inference_task(void *params) {
           this_mww->ring_buffer_ = temp_ring_buffer;
         }
       }
+    }
+
+    if (!(xEventGroupGetBits(this_mww->event_group_) & ERROR_BITS)) {
+#ifdef PIPPA_CRNN_SELF_TEST
+      for (auto *model : this_mww->wake_word_models_) {
+        if (model->get_id() == "pippa") {
+          // Retain the oracle result for deferred reporting, but do not make a
+          // diagnostic mismatch prevent live microphone inference.
+          model->run_crnn_boot_self_test();
+        }
+      }
+#endif
     }
 
     if (!(xEventGroupGetBits(this_mww->event_group_) & ERROR_BITS)) {
@@ -429,6 +457,14 @@ void MicroWakeWord::resume_task_() {
 void MicroWakeWord::loop() {
   uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
+#ifdef PIPPA_CRNN_SELF_TEST
+  for (auto *model : this->wake_word_models_) {
+    if (model->get_id() == "pippa") {
+      model->report_crnn_boot_self_test();
+    }
+  }
+#endif
+
   if (event_group_bits & EventGroupBits::ERROR_MEMORY) {
     xEventGroupClearBits(this->event_group_, EventGroupBits::ERROR_MEMORY);
     ESP_LOGE(TAG, "Encountered an error allocating buffers");
@@ -453,6 +489,18 @@ void MicroWakeWord::loop() {
 
 #ifdef PIPPA_CRNN_METRICS
   for (auto *model : this->wake_word_models_) {
+    CrnnScoreMetricsSnapshot scores;
+    if (model->take_crnn_score_snapshot(&scores)) {
+      const uint16_t audio_peak = this->crnn_audio_peak_.exchange(0, std::memory_order_relaxed);
+      ESP_LOGI(TAG,
+               "CRNN_SCORE model=%s n=%" PRIu32
+               " audio_peak=%u input_byte_max=%u/255 input_mean=%u..%u/255 input_delta_l1_max=%" PRIu32
+               " raw_max=%u/255 sliding_average_max=%u/255 cutoff=%u/255",
+               model->get_id().c_str(), scores.samples, audio_peak, scores.input_byte_max, scores.input_mean_min,
+               scores.input_mean_max, scores.input_delta_l1_max, scores.raw_max, scores.sliding_average_max,
+               model->get_probability_cutoff());
+    }
+
     CrnnRuntimeMetricsSnapshot metrics;
     if (model->take_crnn_metrics_snapshot(&metrics)) {
       ESP_LOGI(TAG,
