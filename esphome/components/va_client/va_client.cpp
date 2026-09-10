@@ -10,6 +10,11 @@
 #include <esp_websocket_client.h>
 #include <esp_event.h>
 #include <esp_heap_caps.h>
+#ifdef USE_PIPPA_WEB_CAPTURE
+#include "esphome/core/application.h"
+#include <freertos/task.h>
+#include <cstdio>
+#endif
 
 namespace esphome {
 namespace va_client {
@@ -56,6 +61,12 @@ void VaClient::setup() {
   } else {
     ESP_LOGE(TAG, "Microphone not configured");
   }
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->capture_source_ != nullptr) {
+    this->capture_source_->add_data_callback(
+        [this](const std::vector<uint8_t> &data) { this->capture_audio_(data); });
+  }
+#endif
 
   // Allocate the audio ring buffer in PSRAM (8 MB available, internal RAM
   // is only 320 KB and we don't want to starve wifi/mww).
@@ -121,6 +132,12 @@ void VaClient::setup() {
 }
 
 void VaClient::loop() {
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->is_wake_recording()) {
+    this->capture_loop_();
+    return;  // Capture owns the one TX queue/socket; no playback/session work.
+  }
+#endif
   // Always service input transport before playback. Some playback paths return
   // early while priming the speaker chain; microphone audio must not wait on
   // that unrelated output state.
@@ -301,6 +318,13 @@ void VaClient::loop() {
 }
 
 void VaClient::connect_() {
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->capture_transition_busy_.load(std::memory_order_acquire))
+    return;
+  if (this->is_wake_recording() &&
+      this->capture_phase_.load() != CapturePhase::CONNECTING)
+    return;
+#endif
   if (this->ws_handle_ != nullptr) {
     // Already initialised; just (re)start. A synchronous start failure must
     // reschedule — otherwise the reconnect chain stalls silently and the
@@ -315,6 +339,13 @@ void VaClient::connect_() {
 
   esp_websocket_client_config_t cfg = {};
   cfg.uri = this->url_.c_str();
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->is_wake_recording()) {
+    cfg.headers = this->capture_auth_header_.c_str();
+    cfg.network_timeout_ms = 5000;
+    cfg.buffer_size = 1024;
+  }
+#endif
   cfg.disable_auto_reconnect = true;  // we drive reconnects ourselves with exponential backoff
   cfg.reconnect_timeout_ms = 5000;    // ignored because disable_auto_reconnect=true
 
@@ -340,6 +371,12 @@ void VaClient::connect_() {
 }
 
 void VaClient::schedule_reconnect_() {
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->is_wake_recording()) {
+    this->capture_disconnected_.store(1, std::memory_order_release);
+    return;
+  }
+#endif
   // esp_websocket_client emits multiple events per failure (DISCONNECTED,
   // CLOSED, sometimes ERROR). Coalesce them into a single reconnect.
   if (this->reconnect_pending_) {
@@ -416,6 +453,23 @@ void VaClient::fail_control_channel_(const char *operation) {
 }
 
 void VaClient::on_ws_event(int32_t event_id, void *event_data) {
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->is_wake_recording()) {
+    const auto phase = this->capture_phase_.load(std::memory_order_acquire);
+    if (phase == CapturePhase::CONNECTING || phase == CapturePhase::RECORDING ||
+        phase == CapturePhase::DRAINING) {
+      if (event_id == WEBSOCKET_EVENT_CONNECTED)
+        this->capture_connected_.store(1, std::memory_order_release);
+      else if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_CLOSED ||
+               event_id == WEBSOCKET_EVENT_ERROR) {
+        this->capture_connected_.store(0, std::memory_order_release);
+        this->capture_disconnected_.store(1, std::memory_order_release);
+        this->capture_accepting_.store(0, std::memory_order_release);
+      }
+    }
+    return;  // Never send the normal Realtime start marker to a recording sink.
+  }
+#endif
   auto *data = static_cast<esp_websocket_event_data_t *>(event_data);
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED: {
@@ -505,6 +559,8 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
 }
 
 void VaClient::handle_text_(const char *data, size_t len) {
+  if (this->is_wake_recording())
+    return;
   std::string msg(data, len);
   ESP_LOGD(TAG, "WS text: %s", msg.c_str());
 
@@ -610,6 +666,8 @@ void VaClient::handle_text_(const char *data, size_t len) {
 }
 
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
+  if (this->is_wake_recording())
+    return;
   if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
     return;
   if (this->control_channel_dirty_.load(std::memory_order_acquire))
@@ -726,6 +784,14 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
 }
 
 void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
+  if (this->is_wake_recording())
+    return;  // The opt-in MicrophoneSource performs the sole capture conversion.
+#ifdef USE_PIPPA_WEB_CAPTURE
+  if (this->capture_preroll_reset_.exchange(0, std::memory_order_acq_rel)) {
+    this->preroll_count_ = 0;
+    this->preroll_head_ = 0;
+  }
+#endif
   // Snapshot the queue generation before touching this frame. A session
   // boundary that occurs while we downmix must invalidate the eventual write.
   const uint32_t callback_generation =
@@ -1109,6 +1175,8 @@ const char *VaClient::phase_name_(Phase p) {
 }
 
 void VaClient::set_phase_(const std::string &phase) {
+  if (this->is_wake_recording())
+    return;
   if (this->control_channel_dirty_.load(std::memory_order_acquire))
     return;
   if (this->session_starting_.load(std::memory_order_acquire)) {
@@ -1337,6 +1405,8 @@ void VaClient::set_phase_(const std::string &phase) {
   // the main loop via defer().
   std::string phase_copy = phase;
   this->defer([this, phase_copy]() {
+    if (this->is_wake_recording())
+      return;
     // We deliberately do NOT call speaker->stop() on "listening" anymore:
     // the speaker task runs continuously after setup() and play() just
     // appends to its ring buffer. Stop/start churn was creating multiple
@@ -1353,6 +1423,8 @@ void VaClient::start_session() { this->start_session_(false); }
 void VaClient::start_session_with_preroll() { this->start_session_(true); }
 
 void VaClient::begin_wake_capture() {
+  if (this->is_wake_recording())
+    return;
   // Close the old stream before any yaml action can block. A racing callback
   // that already passed the outer gate is rejected by the generation change
   // and retained in pre-roll instead of the old TX queue. Publish the boundary
@@ -1371,6 +1443,8 @@ void VaClient::begin_wake_capture() {
 }
 
 void VaClient::start_session_(bool replay_preroll) {
+  if (this->is_wake_recording())
+    return;
   if (this->session_starting_.exchange(1, std::memory_order_acq_rel) != 0) {
     this->clear_wake_boundary_();
     ESP_LOGW(TAG, "start_session() ignored — wake marker send already in progress");
@@ -1718,6 +1792,8 @@ void VaClient::fire_phase_led_(const std::string &phase) {
 }
 
 void VaClient::commit_followup_mic() {
+  if (this->is_wake_recording())
+    return;
   // Called from yaml's on_followup_opened automation once the chime has
   // finished playing AND the i2s tail has cleared (wait_until + delay).
   // If anything pre-empted us between trigger fire and here (a fresh
@@ -1755,6 +1831,8 @@ void VaClient::commit_followup_mic() {
 }
 
 bool VaClient::send_interrupt() {
+  if (this->is_wake_recording())
+    return false;
   // Best-effort cancel to the backend — ONLY if the socket is alive. The local
   // cleanup below must ALWAYS run: returning early on a dead socket (the old
   // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
@@ -1828,6 +1906,451 @@ bool VaClient::send_interrupt() {
            delivered ? "sent" : "not sent");
   return delivered;
 }
+
+#ifdef USE_PIPPA_WEB_CAPTURE
+namespace {
+bool capture_identifier(const std::string &value, size_t minimum, size_t maximum) {
+  if (value.size() < minimum || value.size() > maximum)
+    return false;
+  for (char c : value) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_'))
+      return false;
+  }
+  return true;
+}
+
+std::string capture_json_string(const std::string &value) {
+  std::string result = "\"";
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\')
+      result += '\\';
+    if (c >= 32)
+      result += static_cast<char>(c);
+  }
+  return result + "\"";
+}
+}  // namespace
+
+bool VaClient::capture_muted_() const {
+  return this->mic_ == nullptr || this->mic_->get_mute_state() ||
+         this->capture_mute_ == nullptr || !this->capture_mute_->has_state() ||
+         this->capture_mute_->state;
+}
+
+bool VaClient::capture_playback_busy_() const {
+  if (this->capture_player_ == nullptr || this->speaker_ == nullptr)
+    return true;
+  const auto state = this->capture_player_->state;
+  return (state != media_player::MEDIA_PLAYER_STATE_IDLE &&
+          state != media_player::MEDIA_PLAYER_STATE_OFF) ||
+         this->speaker_->has_buffered_data();
+}
+
+bool VaClient::capture_source_matches_() const {
+  if (this->capture_source_ == nullptr || this->capture_wake_source_ == nullptr)
+    return false;
+  // ID/channel are derived once from the final config; gain can be changed
+  // through MicrophoneSource at runtime and must still match when recording.
+  for (auto *source : {this->capture_source_, this->capture_wake_source_}) {
+    const auto info = source->get_audio_stream_info();
+    if (info.get_sample_rate() != 16000 || info.get_channels() != 1 ||
+        info.get_bits_per_sample() != 16 || source->get_gain_factor() != this->capture_gain_)
+      return false;
+  }
+  return true;
+}
+
+bool VaClient::start_wake_recording(const std::string &sink_url, const std::string &session_id,
+                                   const std::string &token, int duration_ms) {
+  // The API overlay is opt-in and encrypted. Never log bearer credentials.
+  if (this->is_wake_recording() || this->capture_transition_busy_.load() || this->capture_restore_failed_ ||
+      this->capture_source_ == nullptr || this->capture_mww_ == nullptr || this->capture_wake_source_ == nullptr ||
+      this->mic_tx_storage_ == nullptr || this->mic_tx_send_buf_ == nullptr ||
+      this->audio_buf_ == nullptr || this->preroll_buf_ == nullptr ||
+      this->is_failed() || this->capture_muted_() || this->capture_playback_busy_() ||
+      duration_ms < 3000 || duration_ms > 30000 ||
+      !capture_identifier(session_id, 1, 80) || !capture_identifier(token, 32, 128) ||
+      sink_url.size() < 13 || sink_url.size() > 256 || sink_url.compare(0, 5, "ws://") != 0 ||
+      sink_url.substr(sink_url.size() - 7) != "/device" ||
+      sink_url.find_first_of("\r\n\t @?#\\") != std::string::npos) {
+    ESP_LOGW(TAG, "Wake recording rejected: invalid request or device unavailable");
+    return false;
+  }
+  if (!this->capture_source_matches_()) {
+    ESP_LOGW(TAG, "Wake recording rejected: microphone format changed");
+    return false;
+  }
+  size_t playback_bytes;
+  portENTER_CRITICAL(&this->ring_mux_);
+  playback_bytes = this->audio_fill_;
+  portEXIT_CRITICAL(&this->ring_mux_);
+  if (playback_bytes || this->streaming_.load() || this->session_starting_.load() ||
+      static_cast<Phase>(this->current_phase_.load()) != Phase::IDLE ||
+      this->followup_pending_ || this->followup_armed_ || this->idle_emit_pending_.load() ||
+      this->waiting_for_speaker_stop_.load() ||
+      (this->last_fed_ms_ != 0 && millis() - this->last_fed_ms_ < kWakeReplayTtsQuietMs)) {
+    ESP_LOGW(TAG, "Wake recording rejected: conversation or playback is busy");
+    return false;
+  }
+  this->capture_normal_url_ = this->url_;
+  this->capture_sink_url_ = sink_url;
+  this->capture_session_id_ = session_id;
+  this->capture_auth_header_ = "Authorization: Bearer " + token + "\r\n";
+  this->capture_duration_ms_ = static_cast<uint32_t>(duration_ms);
+  this->capture_target_samples_ = this->capture_duration_ms_ * 16;
+  this->capture_input_samples_.store(0);
+  this->capture_samples_sent_ = 0;
+  this->capture_dropped_bytes_.store(0);
+  this->capture_send_failures_ = 0;
+  this->capture_callback_max_us_.store(0);
+  this->capture_overflow_.store(0);
+  this->capture_mute_seen_.store(0);
+  this->capture_connected_.store(0);
+  this->capture_disconnected_.store(0);
+  this->capture_queue_high_water_ = 0;
+  this->capture_valid_ = true;
+  this->capture_reason_ = "duration_limit";
+  this->capture_started_sent_ = false;
+  this->capture_wake_was_running_ = this->capture_mww_->is_running();
+  this->capture_audio_restored_ = false;
+  this->capture_wake_restart_requested_ = false;
+  this->capture_restore_started_ms_ = 0;
+  this->capture_phase_started_ms_ = millis();
+  this->capture_phase_.store(CapturePhase::STOPPING_WAKE, std::memory_order_release);
+  for (const char *timer : {"va_reconnect", "va_stable_connection", "va_no_speech", "va_followup",
+                            "va_followup_open", "va_tts_tail"})
+    this->cancel_timeout(timer);
+  this->reconnect_pending_ = false;
+  this->streaming_.store(0);
+  this->clear_mic_tx_();
+  this->clear_wake_boundary_();
+  // Own the same I2S microphone before mWW releases its listener. Source
+  // conversion is ESPHome's exact channel/gain/clip path, not another DSP path.
+  this->capture_source_->start();
+  this->capture_mww_->stop();
+  ESP_LOGI(TAG, "Wake recording requested; waiting for inference to stop");
+  return true;
+}
+
+void VaClient::stop_wake_recording() {
+  if (this->is_wake_recording())
+    this->capture_stop_("operator_stop", this->capture_started_sent_);
+}
+
+void VaClient::capture_stop_(const char *reason, bool valid) {
+  const auto phase = this->capture_phase_.load();
+  if (phase == CapturePhase::IDLE || phase == CapturePhase::RETIRING_CAPTURE)
+    return;
+  this->capture_accepting_.store(0, std::memory_order_release);
+  if (!valid || phase != CapturePhase::DRAINING)
+    this->capture_reason_ = reason;
+  this->capture_valid_ = this->capture_valid_ && valid;
+  // Do not reuse/destroy a handle while the transition worker owns it.
+  if (phase == CapturePhase::RETIRING_NORMAL) {
+    this->capture_valid_ = false;
+    this->capture_phase_.store(CapturePhase::RETIRING_CAPTURE, std::memory_order_release);
+    this->capture_restore_audio_();
+    return;
+  }
+  if (phase != CapturePhase::DRAINING) {
+    this->capture_phase_started_ms_ = millis();
+    this->capture_phase_.store(CapturePhase::DRAINING, std::memory_order_release);
+  }
+}
+
+void VaClient::capture_audio_(const std::vector<uint8_t> &data) {
+  if (!this->capture_accepting_.load(std::memory_order_acquire))
+    return;
+  this->capture_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+  // Queue callback timing only: ESPHome's source conversion ran before entry.
+  const uint32_t started = micros();
+  if (this->mic_->get_mute_state())
+    this->capture_mute_seen_.store(1, std::memory_order_release);
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  if (this->capture_accepting_.load(std::memory_order_relaxed)) {
+    const uint32_t previous = this->capture_input_samples_.load(std::memory_order_relaxed);
+    const size_t count = std::min(data.size() / 2,
+                                  static_cast<size_t>(this->capture_target_samples_ - previous));
+    if (data.size() % 2 != 0) {
+      this->capture_overflow_.store(1);
+      this->capture_accepting_.store(0);
+    } else if (count) {
+      if (!this->mic_tx_ring_.push_all(data.data(), count * 2)) {
+        this->capture_dropped_bytes_.fetch_add(count * 2, std::memory_order_relaxed);
+        this->capture_overflow_.store(1);
+        this->capture_accepting_.store(0);
+      }
+      this->capture_input_samples_.store(previous + count, std::memory_order_release);
+      this->capture_queue_high_water_ = std::max(this->capture_queue_high_water_, this->mic_tx_ring_.size());
+      if (previous + count == this->capture_target_samples_)
+        this->capture_accepting_.store(0, std::memory_order_release);
+    }
+  }
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+  const uint32_t elapsed = micros() - started;
+  uint32_t maximum = this->capture_callback_max_us_.load(std::memory_order_relaxed);
+  while (elapsed > maximum && !this->capture_callback_max_us_.compare_exchange_weak(maximum, elapsed)) {}
+  this->capture_callbacks_.fetch_sub(1, std::memory_order_release);
+}
+
+bool VaClient::capture_send_text_(const std::string &text) {
+  if (!this->capture_connected_.load() || this->ws_handle_ == nullptr)
+    return false;
+  const int sent = esp_websocket_client_send_text(
+      static_cast<esp_websocket_client_handle_t>(this->ws_handle_), text.data(), text.size(),
+      pdMS_TO_TICKS(10));
+  if (sent != static_cast<int>(text.size())) {
+    ++this->capture_send_failures_;
+    return false;
+  }
+  return true;
+}
+
+void VaClient::capture_restore_audio_() {
+  if (this->capture_audio_restored_)
+    return;
+  this->capture_accepting_.store(0, std::memory_order_release);
+  if (!this->capture_restore_started_ms_)
+    this->capture_restore_started_ms_ = millis();
+  if (millis() - this->capture_restore_started_ms_ > 3000) {
+    this->capture_source_->stop();
+    this->capture_audio_restored_ = true;
+    this->capture_restore_failed_ = true;
+    ESP_LOGE(TAG, "Recording cleanup released microphone; wake restoration FAILED (capture disabled until recovery)");
+    return;
+  }
+  // A timeout may arrive while stop() is still pending. Calling start() then
+  // would be ignored because mWW is still running. Retry restoration from
+  // loop after it acknowledges the stop, without blocking the main loop.
+  if (this->capture_wake_was_running_ && !this->capture_wake_restart_requested_) {
+    if (this->capture_mww_->is_running())
+      return;
+    this->capture_mww_->start();
+    this->capture_wake_restart_requested_ = true;
+    return;
+  }
+  if (this->capture_wake_was_running_ && !this->capture_wake_source_->is_running())
+    return;
+  this->capture_source_->stop();
+  this->capture_audio_restored_ = true;
+}
+
+void VaClient::capture_retire_task_(void *argument) {
+  auto *self = static_cast<VaClient *>(argument);
+  auto handle = static_cast<esp_websocket_client_handle_t>(self->capture_retiring_handle_);
+  bool ok = true;
+  if (handle != nullptr) {
+    // IDF 1.7.0 stop/destroy may wait indefinitely. They must NEVER run on
+    // the microphone/main loop or the websocket's own event callback task.
+    esp_websocket_unregister_events(handle, WEBSOCKET_EVENT_ANY, va_ws_event_handler);
+    if (esp_websocket_client_is_connected(handle))
+      esp_websocket_client_stop(handle);
+    ok = esp_websocket_client_destroy(handle) == ESP_OK;
+  }
+  self->capture_transition_ok_.store(ok ? 1 : 0, std::memory_order_relaxed);
+  self->capture_transition_done_.store(1, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+bool VaClient::capture_retire_socket_() {
+  this->capture_connected_.store(0);
+  this->ws_connected_.store(0);
+  this->capture_retiring_handle_ = this->ws_handle_;
+  this->ws_handle_ = nullptr;
+  this->capture_transition_done_.store(0);
+  this->capture_transition_ok_.store(0);
+  this->capture_transition_busy_.store(1, std::memory_order_release);
+  if (xTaskCreate(VaClient::capture_retire_task_, "va_capture_close", 4096, this, 1, nullptr) != pdPASS) {
+    // Keep the handle quarantined. Reconnecting would create a competing
+    // client. Audio/wake restoration still runs; reboot is a last resort.
+    this->capture_valid_ = false;
+    this->capture_reason_ = "socket_worker_allocation_failed";
+    this->capture_phase_.store(CapturePhase::RETIRING_CAPTURE);
+    this->capture_restore_audio_();
+    ESP_LOGE(TAG, "Recording socket retirement unavailable; backend held offline");
+    return false;
+  }
+  return true;
+}
+
+void VaClient::capture_footer_() {
+  size_t remaining;
+  size_t high_water;
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  remaining = this->mic_tx_ring_.size();
+  high_water = this->capture_queue_high_water_;
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+  const bool normal_end = this->capture_reason_ == "duration_limit" || this->capture_reason_ == "operator_stop";
+  const bool complete = normal_end && this->capture_valid_ && this->capture_started_sent_ && remaining == 0 &&
+      this->capture_send_failures_ == 0 && this->capture_dropped_bytes_.load() == 0 &&
+      this->capture_mute_seen_.load() == 0 && this->capture_samples_sent_ > 0 &&
+      this->capture_samples_sent_ == this->capture_input_samples_.load();
+  if (this->capture_started_sent_) {
+    const std::string footer = "{\"type\":\"capture_finished\",\"session_id\":" +
+        capture_json_string(this->capture_session_id_) + ",\"complete\":" + (complete ? "true" : "false") +
+        ",\"reason\":" + capture_json_string(this->capture_reason_) +
+        ",\"samples_sent\":" + std::to_string(this->capture_samples_sent_) +
+        ",\"dropped_bytes\":" + std::to_string(this->capture_dropped_bytes_.load() + remaining) +
+        ",\"send_failures\":" + std::to_string(this->capture_send_failures_) +
+        ",\"mute_seen\":" + (this->capture_mute_seen_.load() ? "true" : "false") +
+        ",\"callback_max_us\":" + std::to_string(this->capture_callback_max_us_.load()) +
+        ",\"queue_high_water_bytes\":" + std::to_string(high_water) + "}";
+    this->capture_send_text_(footer);  // Missing/partial footer means incomplete at the host.
+  }
+  this->capture_phase_.store(CapturePhase::RETIRING_CAPTURE, std::memory_order_release);
+  this->capture_phase_started_ms_ = millis();
+  this->capture_restore_audio_();
+  this->capture_retire_socket_();
+}
+
+void VaClient::capture_loop_() {
+  auto phase = this->capture_phase_.load(std::memory_order_acquire);
+  const uint32_t now = millis();
+  if (phase == CapturePhase::RETIRING_NORMAL || phase == CapturePhase::RETIRING_CAPTURE) {
+    if (phase == CapturePhase::RETIRING_CAPTURE)
+      this->capture_restore_audio_();
+    if (!this->capture_transition_done_.load(std::memory_order_acquire)) {
+      if (now - this->capture_phase_started_ms_ > 7000) {
+        this->capture_valid_ = false;
+        this->capture_reason_ = "socket_transition_timeout";
+        this->capture_phase_.store(CapturePhase::RETIRING_CAPTURE);
+        this->capture_restore_audio_();
+      }
+      return;
+    }
+    if (!this->capture_transition_ok_.load()) {
+      this->capture_restore_audio_();
+      this->capture_phase_.store(CapturePhase::RETIRING_CAPTURE);
+      return;  // No second client when destruction was not confirmed.
+    }
+    this->capture_transition_busy_.store(0, std::memory_order_release);
+    this->capture_retiring_handle_ = nullptr;
+    if (phase == CapturePhase::RETIRING_CAPTURE) {
+      this->capture_restore_audio_();
+      if (!this->capture_audio_restored_)
+        return;
+      this->clear_mic_tx_();
+      this->capture_preroll_reset_.store(1, std::memory_order_release);
+      this->preroll_discard_pending_.store(1);
+      this->url_ = this->capture_normal_url_;
+      this->capture_auth_header_.clear();
+      this->capture_sink_url_.clear();
+      this->capture_phase_.store(CapturePhase::IDLE, std::memory_order_release);
+      this->connect_();
+      return;
+    }
+    this->url_ = this->capture_sink_url_;
+    this->capture_phase_started_ms_ = now;
+    this->capture_phase_.store(CapturePhase::CONNECTING, std::memory_order_release);
+    this->connect_();
+    return;
+  }
+  if (this->capture_muted_()) {
+    this->capture_mute_seen_.store(1);
+    this->capture_stop_("muted", false);
+  } else if (!this->capture_source_matches_()) {
+    this->capture_stop_("microphone_source_changed", false);
+  } else if (this->capture_playback_busy_()) {
+    this->capture_stop_("playback_started", false);
+  } else if (this->capture_disconnected_.load()) {
+    this->capture_stop_("disconnected", false);
+  } else if (this->capture_overflow_.load()) {
+    this->capture_stop_("capture_queue_overflow", false);
+  }
+  phase = this->capture_phase_.load();
+  if (phase == CapturePhase::STOPPING_WAKE) {
+    if (this->capture_mww_->is_running()) {
+      if (now - this->capture_phase_started_ms_ > 3000)
+        this->capture_stop_("inference_stop_timeout", false);
+      return;
+    }
+    this->capture_phase_started_ms_ = now;
+    this->capture_phase_.store(CapturePhase::RETIRING_NORMAL, std::memory_order_release);
+    this->capture_retire_socket_();
+    return;
+  }
+  if (phase == CapturePhase::CONNECTING) {
+    if (now - this->capture_phase_started_ms_ > 7000) {
+      this->capture_stop_("sink_connection_timeout", false);
+      return;
+    }
+    if (!this->capture_connected_.load())
+      return;
+    if (this->capture_mww_->is_running()) {
+      this->capture_mww_->stop();
+      this->capture_stop_("inference_restarted", false);
+      return;
+    }
+    const std::string header = "{\"type\":\"capture_started\",\"protocol\":1,\"session_id\":" +
+        capture_json_string(this->capture_session_id_) +
+        ",\"sample_rate\":16000,\"channels\":1,\"bits_per_sample\":16,\"mic_channel\":" +
+        std::to_string(this->capture_channel_) + ",\"gain_factor\":" + std::to_string(this->capture_gain_) + "," +
+        "\"device_name\":" + capture_json_string(App.get_name()) +
+        ",\"firmware_build\":" + capture_json_string(std::string(__DATE__) + " " + __TIME__) +
+        ",\"requested_duration_ms\":" + std::to_string(this->capture_duration_ms_) +
+        ",\"microphone_id\":" + capture_json_string(this->capture_microphone_id_) +
+        ",\"source_matches_mww_config\":true" +
+        ",\"callback_timing_scope\":\"queue_callback_only_excludes_source_conversion\"" +
+        ",\"mode\":\"capture_only\",\"source\":\"ESPHome MicrophoneSource; final-config matched to mWW\"," +
+        "\"upstream_i2s_continuity_verified\":false}";
+    if (!this->capture_send_text_(header)) {
+      this->capture_stop_("start_marker_failed", false);
+      return;
+    }
+    this->capture_started_sent_ = true;
+    this->capture_started_ms_ = now;
+    this->capture_phase_.store(CapturePhase::RECORDING, std::memory_order_release);
+    this->capture_accepting_.store(1, std::memory_order_release);
+    return;
+  }
+  if (phase == CapturePhase::RECORDING) {
+    if (this->capture_mww_->is_running()) {
+      this->capture_mww_->stop();
+      this->capture_stop_("inference_restarted", false);
+    } else if (this->capture_input_samples_.load() == this->capture_target_samples_) {
+      this->capture_stop_("duration_limit", true);
+    } else if (now - this->capture_started_ms_ > this->capture_duration_ms_ + 1500) {
+      this->capture_stop_("microphone_duration_timeout", false);
+    }
+  }
+  phase = this->capture_phase_.load();
+  if (phase != CapturePhase::RECORDING && phase != CapturePhase::DRAINING)
+    return;
+  if (phase == CapturePhase::DRAINING && this->capture_callbacks_.load(std::memory_order_acquire))
+    return;
+  size_t length;
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  length = this->mic_tx_ring_.peek(this->mic_tx_send_buf_ + 8, kMicTxSendChunkBytes - 8);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+  if (phase == CapturePhase::DRAINING &&
+      (length == 0 || !this->capture_connected_.load() || !this->capture_valid_ ||
+       now - this->capture_phase_started_ms_ > 5000)) {
+    if (length && this->capture_valid_) {
+      this->capture_valid_ = false;
+      this->capture_reason_ = "drain_timeout";
+    }
+    this->capture_footer_();
+    return;
+  }
+  if (!length)
+    return;
+  for (size_t i = 0; i < 8; ++i)
+    this->mic_tx_send_buf_[i] = static_cast<uint8_t>(this->capture_samples_sent_ >> ((7 - i) * 8));
+  const int sent = esp_websocket_client_send_bin(
+      static_cast<esp_websocket_client_handle_t>(this->ws_handle_),
+      reinterpret_cast<const char *>(this->mic_tx_send_buf_), length + 8, pdMS_TO_TICKS(10));
+  if (sent != static_cast<int>(length + 8)) {
+    ++this->capture_send_failures_;
+    this->capture_stop_("pcm_send_failed", false);
+    return;  // A partial WS message is never retried as if it were contiguous PCM.
+  }
+  portENTER_CRITICAL(&this->mic_tx_mux_);
+  this->mic_tx_ring_.consume(length);
+  portEXIT_CRITICAL(&this->mic_tx_mux_);
+  this->capture_samples_sent_ += length / 2;
+}
+#endif  // USE_PIPPA_WEB_CAPTURE
 
 }  // namespace va_client
 }  // namespace esphome
