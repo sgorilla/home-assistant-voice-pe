@@ -6,6 +6,12 @@
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
+#ifdef USE_PIPPA_WEB_CAPTURE
+#include "esphome/components/microphone/microphone_source.h"
+#include "esphome/components/micro_wake_word/micro_wake_word.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/media_player/media_player.h"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -56,6 +62,28 @@ class VaClient : public Component {
     return ws_connected_.load(std::memory_order_acquire) != 0;
   }
 
+  // Optional corpus-capture mode. This is deliberately not a wake trial: mWW
+  // is stopped while the existing PCM queue/socket serves the browser sink.
+  bool is_wake_recording() const {
+#ifdef USE_PIPPA_WEB_CAPTURE
+    return this->capture_phase_.load(std::memory_order_acquire) != CapturePhase::IDLE;
+#else
+    return false;
+#endif
+  }
+#ifdef USE_PIPPA_WEB_CAPTURE
+  void set_recording_source(microphone::MicrophoneSource *source) { capture_source_ = source; }
+  void set_recording_format(uint8_t channel, int32_t gain) { capture_channel_ = channel; capture_gain_ = gain; }
+  void set_recording_microphone_id(const std::string &value) { capture_microphone_id_ = value; }
+  void set_recording_wake_word(micro_wake_word::MicroWakeWord *mww) { capture_mww_ = mww; }
+  void set_recording_wake_source(microphone::MicrophoneSource *source) { capture_wake_source_ = source; }
+  void set_recording_mute_sensor(binary_sensor::BinarySensor *sensor) { capture_mute_ = sensor; }
+  void set_recording_player(media_player::MediaPlayer *player) { capture_player_ = player; }
+  bool start_wake_recording(const std::string &sink_url, const std::string &session_id,
+                            const std::string &token, int duration_ms);
+  void stop_wake_recording();
+#endif
+
   // Delay (ms) the yaml wake handler waits after the wake chime before opening
   // the mic, so the chime's i2s/DAC tail can't leak into the fresh mic and
   // become a ghost turn. Pushed from the backend `hello` (wake_open_delay_ms);
@@ -100,6 +128,63 @@ class VaClient : public Component {
   void on_ws_event(int32_t event_id, void *event_data);
 
  protected:
+#ifdef USE_PIPPA_WEB_CAPTURE
+  enum class CapturePhase : uint32_t { IDLE, STOPPING_WAKE, RETIRING_NORMAL,
+                                      CONNECTING, RECORDING, DRAINING, RETIRING_CAPTURE };
+  void capture_loop_();
+  void capture_audio_(const std::vector<uint8_t> &data);
+  void capture_stop_(const char *reason, bool valid);
+  void capture_restore_audio_();
+  bool capture_retire_socket_();
+  static void capture_retire_task_(void *argument);
+  bool capture_send_text_(const std::string &text);
+  bool capture_muted_() const;
+  bool capture_playback_busy_() const;
+  bool capture_source_matches_() const;
+  void capture_footer_();
+  microphone::MicrophoneSource *capture_source_{nullptr};
+  microphone::MicrophoneSource *capture_wake_source_{nullptr};
+  micro_wake_word::MicroWakeWord *capture_mww_{nullptr};
+  binary_sensor::BinarySensor *capture_mute_{nullptr};
+  media_player::MediaPlayer *capture_player_{nullptr};
+  uint8_t capture_channel_{0};
+  int32_t capture_gain_{1};
+  std::atomic<CapturePhase> capture_phase_{CapturePhase::IDLE};
+  std::atomic<uint32_t> capture_accepting_{0};
+  std::atomic<uint32_t> capture_connected_{0};
+  std::atomic<uint32_t> capture_disconnected_{0};
+  std::atomic<uint32_t> capture_transition_busy_{0};
+  std::atomic<uint32_t> capture_transition_done_{0};
+  std::atomic<uint32_t> capture_transition_ok_{0};
+  std::atomic<uint32_t> capture_callbacks_{0};
+  std::atomic<uint32_t> capture_mute_seen_{0};
+  std::atomic<uint32_t> capture_dropped_bytes_{0};
+  std::atomic<uint32_t> capture_callback_max_us_{0};
+  std::atomic<uint32_t> capture_input_samples_{0};
+  std::atomic<uint32_t> capture_overflow_{0};
+  std::atomic<uint32_t> capture_preroll_reset_{0};
+  uint32_t capture_target_samples_{0};
+  uint32_t capture_started_ms_{0};
+  uint32_t capture_phase_started_ms_{0};
+  uint32_t capture_duration_ms_{0};
+  uint32_t capture_restore_started_ms_{0};
+  uint64_t capture_samples_sent_{0};
+  uint32_t capture_send_failures_{0};
+  size_t capture_queue_high_water_{0};
+  bool capture_valid_{false};
+  bool capture_wake_was_running_{false};
+  bool capture_audio_restored_{true};
+  bool capture_restore_failed_{false};  // Latches until reboot; do not silently accept another take.
+  bool capture_wake_restart_requested_{false};
+  bool capture_started_sent_{false};
+  void *capture_retiring_handle_{nullptr};
+  std::string capture_normal_url_;
+  std::string capture_sink_url_;
+  std::string capture_session_id_;
+  std::string capture_auth_header_;
+  std::string capture_reason_;
+  std::string capture_microphone_id_;
+#endif
   void connect_();
   void schedule_reconnect_();
   void fail_control_channel_(const char *operation);

@@ -1,0 +1,75 @@
+# OPT-IN CORPUS CAPTURE WRAPPER -- PREPARED ONLY, NOT BUILT OR DEVICE-VALIDATED.
+# Uses the existing PR5 measurement package, including its microphone override.
+# Do not flash merely to validate this file. Build/physical canaries are separate
+# authorized work on the appropriate host. Wi-Fi/API secrets remain env inputs
+# inherited from pippa-crnn-measurement.yaml; no capture token is stored here.
+#
+# This wrapper intentionally reuses va_client's one WebSocket and MicTxRing.
+# The final validator derives the capture MicrophoneSource from the FINAL mWW
+# configuration (currently channel0/gain1 in PR5; base realtime is1/gain4).
+# No channel, gain or wake-model override is introduced by capture itself.
+packages:
+  measurement: !include pippa-crnn-measurement.yaml
+
+external_components:
+  - source:
+      type: local
+      path: esphome/components
+    components:
+      - va_client
+
+va_client:
+  wake_recording:
+    wake_word: mww
+    mute_sensor: hardware_mute_switch
+    media_player: external_media_player
+
+api:
+  # Prevent a browser-control API reconnect from restarting inference mid-take.
+  # Preserve the existing base+measurement connect actions when not capturing.
+  on_client_connected: !override
+    - if:
+        condition:
+          lambda: return !id(va).is_wake_recording();
+        then:
+          - micro_wake_word.start:
+          - micro_wake_word.disable_model: stop
+          - micro_wake_word.enable_model: pippa
+          - micro_wake_word.disable_model: okay_nabu
+          - script.execute: control_leds
+  actions:
+    - action: start_wake_recording
+      variables:
+        sink_url: string
+        session_id: string
+        token: string
+        duration_ms: int
+      then:
+        - lambda: |-
+            id(va).start_wake_recording(sink_url, session_id, token, duration_ms);
+    - action: stop_wake_recording
+      then:
+        - lambda: id(va).stop_wake_recording();
+
+# REQUIRED LATER CANARIES (none executed as part of preparation):
+# - Final merged config derives the same microphone ID/channel/gain/PCM depth
+#   as mWW and retains encrypted API controls; compare conversion bytes against
+#   the existing mWW source on a bounded fixture before any corpus claim.
+# - Confirm mWW stops before capture_started; reject button/media/mute activity
+#   and never produce a complete take after a queue gap or transport failure.
+# - Normal stop, duration limit, sink rejection/disconnect, API reconnect and
+#   cancellation during connection must restore prior wake state and backend.
+# - Inject a slow/broken sink: main loop stays responsive, no second client,
+#   no growing queue, no sputter/stall. Check PCM counts, source conversion CPU,
+#   peak stack/heap, callback/send timings and upstream I2S continuity separately.
+#   Footer callback_max_us times only queue enqueue/statistics after framework
+#   source conversion; it does not measure that conversion or total I2S work.
+# - Pinned IDF stop/destroy can block: retirement is on one temporary priority1
+#   worker. After7s audio restoration begins, but backend stays offline until
+#   the old client is safely destroyed. Never create a replacement client while
+#   retirement is incomplete; diagnose before any retry/firmware promotion.
+# - A complete audio footer precedes microphone/wake restoration and does not
+#   certify recovery. A 3s wake-listener restoration failure releases capture
+#   ownership and latches further captures off until reboot; inspect logs and
+#   restore normal wake service before collecting more takes.
+# - Capture-only recordings do not establish simultaneous wake-inference quality.
